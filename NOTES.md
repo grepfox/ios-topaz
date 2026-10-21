@@ -2,6 +2,18 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> VAYU (Poco X3 Pro, SM8150-AC, 6 GB) 2026-10-21, branch `vayu` (read VAYU.md) <<<
+
+Different user and phone from the topaz/sweet entries below. Repo fork for CI: `grepfox/ios-topaz` (remote `fork`), branch `vayu`. The phone was NOT connected; nothing has been booted. All hardware values come from the MIUI V14.0.3.0 dump at `~/y/miui/miui_VAYUGlobal_V14.0.3.0.TJUMIXM_6be397120d_13.0` (base DTB `boot/dtb.img` entry "SM8150P v2", dtbo entry "VAYU"). User: bootloader unlocked, 6 GB model.
+
+- Commits: `806f2e4` (xnu 0140 vayu platform), `807d579` (shim/ADT/kbuild vayu target), then docs.
+- Kernel CI: run `39558151658` on grepfox/ios-topaz (0140 on top of 0001-0139): **success**, artifact in `xnu/out-0140/` (has `sweet_soc_vayu`). Only the usual -Wdeclaration-after-statement style warnings.
+- Images (not in git) in `~/vayu-images/`: `shim-boot-vayu-diag.img` (shim only: splash/CPU/DTB memory/UFS GPT on a red screen, reset to fastboot after ~3 min), `shim-boot-vayu-0140-cpu1.img` and `-cpu8.img` (kernel 0140, ADT `shim/out/vayu.adt`, read-only: no ufsrw, so nothing is written; rd=ufsroot0 will fail on Android's userdata, so expect a root-mount panic at best). No iPhone X `/product` node yet (research/ipsw-x/d22ap.adt missing on this PC).
+- 0140 applies cleanly on xnu-8796.141.3 with the whole series (local check; same skips as CI: 0031, 0041 and blacktop's Sonoma/TrustCache/iobuffermemd patches).
+- Shim builds locally with clang 21 + lld (no aarch64 gcc on this PC): `TARGET=vayu VAYU_DTB=<dump>/boot/dtb.img MKBOOTIMG="python3 <aosp mkbootimg>/mkbootimg.py" shim/build.sh` -> boot v2. topaz ADT output verified byte-identical to before.
+- Unverified guesses: splash is a8r8g8b8 1080x2400 stride 4320 at 0x9c000000 (shim reads the SSPP SRC registers to check); DDR above 4 GiB contiguous up to ~0x1_fcc00000 like sweet's 6 GB (shim clamps to ABL /memory); ABL accepts the payload as boot v2 ramdisk without overlapping 0xb0000000 (loader refuses if it does).
+- Next: user boots the diagnostic shim (no payload) and sends a photo; then kernel cpus=1 read-only.
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **LIVE LOG over USB (0077, boot 0077s): no more recovery round-trips.** Boot an image with `sweetusb=2`, run `tools/sweet-usbnet.sh logs/live-NAME.txt` on the PC: it waits for the phone's CDC-ECM interface, sets 192.168.7.1/24 (sudo) and prints/saves the kernel console the phone streams every 100 ms as UDP to 192.168.7.1:5140 (starts with the last 64 KiB). `ping 192.168.7.2` checks the link. Current image: `shim/out/shim-boot-0077s.img` (kernel 0077, ADT sweet-0069hi, cpus=6, sweetfb_noconsole=1, sweetfb_hz=30, sweetusb=2). The recovery pull (`tools/sweet-log-pull.sh`) is still the way after a panic/hang before USB comes up.

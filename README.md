@@ -6,6 +6,8 @@ This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-swe
 
 As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cortex-A73 cores, with **touch, volume and power keys**, and **Wi-Fi**: iOS Settings lists networks, joins WPA2 networks, remembers the password in the keychain and reconnects after a reboot; Safari loads pages over HTTPS. The modem and Wi-Fi firmware are booted by our own XNU driver straight from the phone's stock `modem_a` partition. Rendering in this repository runs on the CPU; GPU acceleration (Adreno 610) works on the phone with patches from HackiOS and will be published here once HackiOS publishes its source (see the roadmap).
 
+> **Poco X3 Pro (vayu, SM8150-AC):** the `vayu` branch adds a second target (shim, ADT, kernel patch 0140); not booted yet. See [VAYU.md](VAYU.md).
+
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. Nothing is flashed to the boot partitions; the kernel is started from RAM with `fastboot boot`.
 
 ## What works

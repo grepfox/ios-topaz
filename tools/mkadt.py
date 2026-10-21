@@ -58,7 +58,10 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 VAYU = dict(
     PHYS_BASE=0xb0000000, MEM_SIZE=0x14cc00000,
     GICD=0x17a00000, GICR=0x17a60000,   # interrupt-controller@17a00000, stride 0x20000
-    FB=0x9c000000, FB_SIZE=0x2400000,   # cont_splash_region@9c000000
+    # cont_splash_region@9c000000 is 0x2400000, but the kernel maps the fbcon
+    # reg into its early I/O tables (room for ~16 MB: 0x2400000 panicked in
+    # pmap_map_bd at SWEET EARLY 17); the panel needs 1080*2400*4 = 0x9e3400.
+    FB=0x9c000000, FB_SIZE=0xf00000,
     UFS=0x01d84000,                     # ufshc@1d84000
     ECID=0x564159550000_0001,           # 'VAYU' + 1, synthetic
 )

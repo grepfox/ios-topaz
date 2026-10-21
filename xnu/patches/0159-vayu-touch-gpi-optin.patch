@@ -1,0 +1,45 @@
+From 6efed4ad82bd831c5eba8edc05f23ecbd414f6dd Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 22:23:41 +0200
+Subject: [PATCH] vayu-0159: touch GPI path only with vayutouchgpi=1; GPII
+ choice by state only
+
+0158 refused every GPII because their error-log reads are random (noise),
+so it booted but tested nothing. The GPI path has reset the phone in
+0153-0157: make it opt-in so normal images boot, and pick the first idle
+GPII.
+---
+ bsd/dev/vayu_touch.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 1f80f0a..48d9278 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -330,6 +330,13 @@ vt_se_init(void)
+ 	vt_wr(vt.se, SE_M_IRQ_EN, M_CMD_DONE | M_ERRORS);
+ 	if (gsi_only) {
+ 		printf("VAYU TOUCH: SE17 FIFO interface disabled by its firmware: GPI DMA mode\n");
++		int gpi_on = 0;
++		(void)PE_parse_boot_argn("vayutouchgpi", &gpi_on, sizeof(gpi_on));
++		if (!gpi_on) {
++			/* experimental: GPI command writes reset the phone so far (0153-0157) */
++			printf("VAYU TOUCH: GPI path off (boot-arg vayutouchgpi=1 to try); no touch\n");
++			return false;
++		}
+ 		sweet_log_flush_now();
+ 		return vg_init();
+ 	}
+@@ -607,7 +614,8 @@ vg_init(void)
+ 		uint32_t err = vt_rd(vg.gpi, 0x23200u + base);
+ 		uint32_t scr = vt_rd(vg.gpi, 0x20060u + base);
+ 		printf("VAYU TOUCH: GPII%u ev %u ch0 %u ch1 %u err %#x ch0 scratch0 %#x\n", n, ev, c0, c1, err, scr);
+-		if (!pick && ev == 0 && c0 == 0 && c1 == 0 && err == 0) {
++		/* the "error log" reads are noise (random values on every GPII, 0157/0158) */
++		if (!pick && ev == 0 && c0 == 0 && c1 == 0) {
+ 			pick = n;
+ 		}
+ 	}
+-- 
+2.53.0
+

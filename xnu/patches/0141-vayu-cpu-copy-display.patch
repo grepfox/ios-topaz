@@ -1,0 +1,55 @@
+From c95f07c287b51c274575661ec69c976365c19853 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 09:30:01 +0200
+Subject: [PATCH] vayu-0141: CPU-copy display by default on vayu
+
+First vayu boot froze the screen when the console moved to its shadow frame
+and VIG0 was pointed there. sweetscan=1 keeps trying direct scanout, with a
+readback log of SRC/stride/flush.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 918ccb9..dabe169 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -353,6 +353,21 @@ AppleCLCD::start(IOService *provider)
+ 				break;
+ 			}
+ 		}
++		/*
++		 * First vayu boot (0140): after the console moved to its shadow
++		 * frame and VIG0 was pointed there, the screen froze on the
++		 * splash contents (display SMMU limited to the splash region, or
++		 * the flush does not latch on this CTL). Until that is solved,
++		 * vayu draws into the boot framebuffer (CPU copy, as sweet did);
++		 * sweetscan=1 tries direct scanout.
++		 */
++		uint32_t scan = 0;
++		(void)PE_parse_boot_argn("sweetscan", &scan, sizeof(scan));
++		if (!scan) {
++			IOLog("SWEET FB: vayu direct scanout off (sweetscan=1 to try), CPU copy to %#llx\n", fPhys);
++			fVig0 = NULL;
++			fCtl0 = NULL;
++		}
+ 	}
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+@@ -630,6 +645,13 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = (1u << 17) | fPipeFlush;      /* flush pipe + CTL: latched at the next vsync */
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	static uint32_t scan_logged;
++	if (sweet_soc_vayu() && scan_logged < 4) {
++		scan_logged++;
++		IODelay(30000);         /* spin ~2 frames: also called from the console path */
++		IOLog("SWEET FB: scan pa %#llx stride %u -> src %#x stride %#x flush %#x\n",
++		    pa, stride, fVig0[0x14 / 4], fVig0[0x24 / 4], fCtl0[0x18 / 4]);
++	}
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
+ }
+-- 
+2.53.0
+

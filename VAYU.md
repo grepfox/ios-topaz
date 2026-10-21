@@ -2,7 +2,9 @@
 
 Port of this repository (topaz, itself a port of sweet) to the Xiaomi **Poco X3 Pro** (`vayu`, Qualcomm **SM8150-AC** / Snapdragon 860, 6 GB). Branch `vayu`.
 
-**Status (2026-10-21): built, not yet booted.** Nothing here has run on a phone yet. The shim, the device tree and the kernel are retargeted from the stock MIUI device trees; every value below comes from the ROM dump, not from a running phone.
+**Status (2026-10-21): iOS 16.7.16 boots to the lock screen** on all eight cores with 5 GiB of RAM, power and volume keys, and a live kernel log over USB (`sweetusb=2`, `tools/sweet-usbnet.sh`). Not yet: touch (Novatek NT36672C), wallpaper (as on topaz), battery, Wi-Fi, audio. The first boot of a new root waits several minutes on the Apple logo while LaunchServices builds its database.
+
+What it took on vayu (kernel patches 0140-0150): the SM8150 platform switch (0140), CPU copy display (0141), USB device mode with an identity SMMU context for stream 0x140 (0142-0144; USB DMA faults had stalled UFS), the shim giving xnu the largest DTB /memory block (ABL: 0x80000000+0x3cc00000, 0xc0000000..0x200000000; was 192 MiB), SCTLR_EL1.SPAN on ARMv8.1+ cores (0149), and diagnostics (sampler kernel backtraces, running-thread xcall sampler, fast-fault loop detector).
 
 ## Why vayu is closer to sweet than to topaz
 

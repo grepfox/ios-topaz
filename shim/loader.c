@@ -79,42 +79,95 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 #if defined(MEM_FROM_FDT)
 /*
- * The ADT's RAM size comes from mkadt.py; the real DRAM layout is what ABL
- * put in /memory. Find the (merged, contiguous) range that holds phys_base
- * and shrink mem_size to fit it. 0: phys_base is not in any range.
+ * The ADT's RAM layout comes from mkadt.py; the real DRAM layout is what ABL
+ * put in /memory (several ranges, with holes where TZ/hyp memory is not
+ * listed). Merge adjacent ranges and give xnu the largest contiguous block
+ * at or above MEM_MIN_BASE (above every fixed carve-out), 32 MiB aligned.
+ * Blocks that start below 4 GiB win (UFS and the display want DMA memory
+ * there); xnu takes physBase from boot_args, so the kernel can go anywhere.
+ * Kernel 0145 log: taking only the block that held 0xb0000000 left xnu
+ * with 12288 pages (192 MiB) and dyld's first vm_allocate never finished.
  */
-static uint64_t mem_fit(uintptr_t dtb, uint64_t base, uint64_t size)
+#define MEM_MIN_BASE	0xb0000000UL
+#define MEM_ALIGN	0x2000000UL
+static struct fdt_range mem_r[16];
+static int mem_n;
+
+static int mem_pick(uintptr_t dtb, uint64_t *base, uint64_t *size)
 {
-	struct fdt_range r[16];
-	int n = fdt_memory(dtb, r, 16);
-	for (int i = 0; i < n && i < 8; i++) {
+	mem_n = fdt_memory(dtb, mem_r, 16);
+	for (int i = 0; i < mem_n && i < 8; i++) {
 		char label[] = "MEM0";
 		label[3] = '0' + i;
-		con_hex2(label, "base=", (uint32_t)(r[i].base >> 4), "size=", (uint32_t)(r[i].size >> 4));
+		con_hex2(label, "base>>4=", (uint32_t)(mem_r[i].base >> 4), "size>>4=", (uint32_t)(mem_r[i].size >> 4));
 	}
-	if (n == 0) {
-		con_str("MEM", "no /memory in DTB, ADT size kept");
-		return size;
+	if (mem_n == 0) {
+		con_str("MEM", "no /memory in DTB, ADT layout kept");
+		return 1;
 	}
-	uint64_t end = 0;
-	for (int i = 0; i < n; i++)
-		if (base >= r[i].base && base < r[i].base + r[i].size)
-			end = r[i].base + r[i].size;
-	if (!end)
+	uint64_t best_lo = 0, best_size = 0;
+	int best_low = 0;
+	for (int i = 0; i < mem_n; i++) {
+		/* the block that starts at range i: grow through adjacent ranges */
+		uint64_t lo = mem_r[i].base, end = lo + mem_r[i].size;
+		int prev = 0;
+		for (int j = 0; j < mem_n; j++)
+			if (mem_r[j].base + mem_r[j].size == lo)
+				prev = 1;
+		if (prev)
+			continue;	/* not the start of a block */
+		for (int grew = 1; grew;) {
+			grew = 0;
+			for (int j = 0; j < mem_n; j++)
+				if (mem_r[j].base == end) {
+					end += mem_r[j].size;
+					grew = 1;
+				}
+		}
+		if (lo < MEM_MIN_BASE)
+			lo = MEM_MIN_BASE;
+		lo = (lo + MEM_ALIGN - 1) & ~(MEM_ALIGN - 1);
+		end &= ~(MEM_ALIGN - 1);
+		int low = lo < 0x100000000UL;
+		if (end > lo && (low > best_low || (low == best_low && end - lo > best_size))) {
+			best_lo = lo;
+			best_size = end - lo;
+			best_low = low;
+		}
+	}
+	if (!best_size)
 		return 0;
-	for (int grew = 1; grew;) {	/* banks reported as separate but adjacent ranges */
-		grew = 0;
-		for (int i = 0; i < n; i++)
-			if (r[i].base == end) {
-				end += r[i].size;
-				grew = 1;
+	*base = best_lo;
+	*size = best_size;
+	con_hex2("MEM", "pick base>>4=", (uint32_t)(best_lo >> 4), "size>>4=", (uint32_t)(best_size >> 4));
+	return 1;
+}
+
+/* Append " sweetmem=BASE+SIZE,..." (hex) so the kernel log shows ABL's /memory */
+static void mem_cmdline(volatile char *cl, int max)
+{
+	static const char hex[] = "0123456789abcdef";
+	int n = 0;
+	while (n < max - 1 && cl[n])
+		n++;
+	const char *tag = " sweetmem=";
+	for (int i = 0; tag[i] && n < max - 1; i++)
+		cl[n++] = tag[i];
+	for (int i = 0; i < mem_n && n < max - 40; i++) {
+		uint64_t v[2] = { mem_r[i].base, mem_r[i].size };
+		for (int k = 0; k < 2; k++) {
+			int started = 0;
+			for (int sh = 60; sh >= 0; sh -= 4) {
+				int d = (v[k] >> sh) & 0xf;
+				if (d || started || sh == 0) {
+					cl[n++] = hex[d];
+					started = 1;
+				}
 			}
+			cl[n++] = k ? ',' : '+';
+		}
 	}
-	if (end - base < size) {
-		size = (end - base) & ~0x1ffffffUL;	/* 32 MiB */
-		con_hex2("MEM", "clamped to=", (uint32_t)(size >> 4), "(x16)", 0);
-	}
-	return size;
+	cl[n] = 0;
 }
 
 /* ADT property: char name[32], u32 length, value. Device memory: 32-bit accesses only. */
@@ -190,20 +243,19 @@ const char *loader_boot(uintptr_t dtb)
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
-	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-	uint64_t mem_size = p->mem_size;
+	uint64_t phys_base = p->phys_base, mem_size = p->mem_size;
 #if defined(MEM_FROM_FDT)
-	mem_size = mem_fit(dtb, p->phys_base, mem_size);
-	if (!mem_size)
-		return "kernel phys_base not in DTB /memory";
+	if (!mem_pick(dtb, &phys_base, &mem_size))
+		return "no usable RAM block in DTB /memory";
 #endif
+	uint64_t pa_of_va_base = phys_base - p->virt_base;	/* pa = va + this */
 	/* values >> 4 so that 64-bit addresses fit the 32-bit fields */
-	con_hex2("PHYS", "base>>4=", (uint32_t)(p->phys_base >> 4), "size>>4=", (uint32_t)(mem_size >> 4));
+	con_hex2("PHYS", "base>>4=", (uint32_t)(phys_base >> 4), "size>>4=", (uint32_t)(mem_size >> 4));
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > p->phys_base && rd_start < p->phys_base + mem_size)
+	if (rd_end > phys_base && rd_start < phys_base + mem_size)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
@@ -219,8 +271,8 @@ const char *loader_boot(uintptr_t dtb)
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 #if defined(MEM_FROM_FDT)
-	if (mem_size != p->mem_size)
-		adt_set_u64(adt_pa, p->adt_size, "dram-size", mem_size);
+	adt_set_u64(adt_pa, p->adt_size, "dram-base", phys_base);
+	adt_set_u64(adt_pa, p->adt_size, "dram-size", mem_size);
 #endif
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
@@ -230,7 +282,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Revision = 2;
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
-	ba->physBase = p->phys_base;
+	ba->physBase = phys_base;
 	ba->memSize = mem_size;
 	ba->topOfKernelData = top;
 	ba->Video.v_baseAddr = (uintptr_t)con_fb;	/* FB_BASE, or where vayu's ABL scans out */
@@ -243,6 +295,9 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+#if defined(MEM_FROM_FDT)
+	mem_cmdline(ba->CommandLine, BOOT_LINE_LENGTH);
+#endif
 	ba->memSizeActual = mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 

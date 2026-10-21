@@ -1,0 +1,40 @@
+From 8135dc849492cc0fc8c7646b4c6c8e82f7e0ad4c Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 15:32:47 +0200
+Subject: [PATCH] vayu-0146: log boot-args and max_mem at platform expert start
+
+The 0145 sampler showed 12288 VM pages (192 MiB) on a 6 GB phone. The
+vayu shim now picks the largest DTB /memory block and appends the ranges
+as sweetmem=...; print them and the resulting max_mem.
+---
+ iokit/Kernel/arm/SweetPlatformExpert.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..248bb6a 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,10 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++__BEGIN_DECLS
++#include <vm/pmap.h>            /* max_mem, mem_size (mach/vm_param.h), as IOMemoryDescriptor.cpp */
++__END_DECLS
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -26,6 +30,9 @@ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	IOLog("SWEET: starting device-tree platform expert\n");
++	/* vayu: the shim appends ABL's /memory as sweetmem=BASE+SIZE,... */
++	IOLog("SWEET: boot-args %s\n", PE_boot_args());
++	IOLog("SWEET: max_mem 0x%llx (%llu MiB), mem_size 0x%lx\n", max_mem, max_mem >> 20, (unsigned long)mem_size);
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
+-- 
+2.53.0
+

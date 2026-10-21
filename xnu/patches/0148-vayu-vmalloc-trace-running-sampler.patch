@@ -1,0 +1,156 @@
+From 22359ef08d3b7276788618dc977f7d938b52b62e Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 17:30:24 +0200
+Subject: [PATCH] vayu-0148: trace pid 1's mach_vm_allocate trap; sample where
+ a running thread is
+
+With 5 GiB (0147) dyld in launchd still never returns from
+mach_vm_allocate (kstate TH_RUN, same user pc over minutes). Log the
+first 24 trap calls of pid 1 (in: addr/size/flags, out: rv/addr), and
+for a TH_RUN thread let every other CPU take an immediate xcall; the
+CPU running it records the interrupted kernel pc/lr/frame chain.
+---
+ osfmk/ipc/mach_kernelrpc.c | 11 ++++++
+ osfmk/kern/exception.c     | 80 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 91 insertions(+)
+
+diff --git a/osfmk/ipc/mach_kernelrpc.c b/osfmk/ipc/mach_kernelrpc.c
+index 4b6dc6f..bc00c4e 100644
+--- a/osfmk/ipc/mach_kernelrpc.c
++++ b/osfmk/ipc/mach_kernelrpc.c
+@@ -68,7 +68,18 @@ _kernelrpc_mach_vm_allocate_trap(struct _kernelrpc_mach_vm_allocate_trap_args *a
+ 			goto done;
+ 		}
+ 
++		/* SWEET (vayu bring-up): dyld in pid 1 never came back from this trap */
++		static int sweet_vma_logged;
++		bool sweet_trace = task_pid(current_task()) == 1 && sweet_vma_logged < 24;
++		if (sweet_trace) {
++			sweet_vma_logged++;
++			printf("SWEET VMA: pid1 in addr 0x%llx size 0x%llx flags 0x%x\n",
++			    (unsigned long long)addr, (unsigned long long)args->size, args->flags);
++		}
+ 		rv = mach_vm_allocate_external(task->map, &addr, args->size, args->flags);
++		if (sweet_trace) {
++			printf("SWEET VMA: pid1 out rv %d addr 0x%llx\n", rv, (unsigned long long)addr);
++		}
+ 		if (rv == KERN_SUCCESS) {
+ 			rv = mach_copyout(&addr, args->addr, sizeof(addr));
+ 		}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 8b8cd28..dd167d1 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -89,6 +89,9 @@
+ 
+ #include <vm/vm_map.h>
+ #include <machine/machine_routines.h>
++#if defined(__arm64__)
++#include <arm/cpu_data_internal.h>
++#endif
+ 
+ #include <security/mac_mach_internal.h>
+ #include <string.h>
+@@ -998,6 +1001,73 @@ sweet_crash_strings(const char *name)
+ void sweet_sample_task(const char *name, int pid, task_t task);
+ extern unsigned int vm_page_free_count, vm_page_wire_count;
+ 
++/*
++ * Where is a RUNNING thread? Every other CPU takes an xcall; the one whose
++ * current thread is the target records the state it was interrupted in
++ * (kernel pc/lr and frame chain). Printed by the sampler afterwards, not
++ * from interrupt context.
++ */
++static struct {
++	thread_t target;
++	int cpu;
++	int user;               /* interrupted in user mode */
++	uint64_t pc, lr, bt[12];
++	int nbt;
++} sweet_run;
++
++static void
++sweet_run_xcall(void *arg __unused)
++{
++	if (current_thread() != sweet_run.target) {
++		return;
++	}
++	arm_saved_state_t *st = getCpuDatap()->cpu_int_state;
++	sweet_run.cpu = cpu_number();
++	if (st == NULL) {
++		sweet_run.user = 1;
++		return;
++	}
++	sweet_run.pc = get_saved_state_pc(st);
++	sweet_run.lr = get_saved_state_lr(st);
++	uint64_t fp = get_saved_state_fp(st);
++	vm_offset_t lo = current_thread()->kernel_stack, hi = lo + kernel_stack_size;
++	sweet_run.nbt = 0;
++	while (sweet_run.nbt < 12 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0) {
++		uint64_t frame[2];
++		if (ml_nofault_copy((vm_offset_t)fp, (vm_offset_t)frame, sizeof(frame)) != sizeof(frame)) {
++			break;
++		}
++		sweet_run.bt[sweet_run.nbt++] = frame[1];
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++}
++
++static void
++sweet_run_sample(const char *name, thread_t thread)
++{
++	char line[400];
++	int n;
++	bzero(&sweet_run, sizeof(sweet_run));
++	sweet_run.target = thread;
++	sweet_run.cpu = -1;
++	printf("SMP %s running: xcall\n", name);
++	(void)cpu_broadcast_immediate_xcall_simple(FALSE, sweet_run_xcall, (void *)1);
++	if (sweet_run.cpu < 0) {
++		printf("SMP %s running: not on any other CPU now\n", name);
++		return;
++	}
++	n = snprintf(line, sizeof(line), "SMP %s running cpu%d %s kpc 0x%lx klr 0x%lx kbt", name, sweet_run.cpu,
++	    sweet_run.user ? "user" : "kernel", (unsigned long)VM_KERNEL_UNSLIDE(sweet_run.pc),
++	    (unsigned long)VM_KERNEL_UNSLIDE(sweet_run.lr));
++	for (int i = 0; i < sweet_run.nbt && n < (int)sizeof(line) - 24; i++) {
++		n += snprintf(line + n, sizeof(line) - n, " 0x%lx", (unsigned long)VM_KERNEL_UNSLIDE(sweet_run.bt[i]));
++	}
++	printf("%s\n", line);
++}
++
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+ {
+@@ -1014,8 +1084,14 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx free %u wired %u kslide 0x%lx\n", name, pid, slide,
+ 	    task->mach_header_vm_address, vm_page_free_count, vm_page_wire_count, vm_kernel_slide);
+ 
++	thread_t run_thread = THREAD_NULL;
++
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (run_thread == THREAD_NULL && (thread->state & TH_RUN) && thread != current_thread()) {
++			run_thread = thread;
++			thread_reference(run_thread);
++		}
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+ 		char line[400];
+ 		int n;
+@@ -1075,6 +1151,10 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		printf("%s\n", line);
+ 	}
+ 	task_unlock(task);
++	if (run_thread != THREAD_NULL) {
++		sweet_run_sample(name, run_thread);
++		thread_deallocate(run_thread);
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.53.0
+

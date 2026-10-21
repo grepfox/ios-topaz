@@ -53,6 +53,7 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - 0154: user says "same" (reset); live log on the user's Arch PC is always empty (asked for `ip -o link`/lsusb/dmesg). 0155: `sweet_log_flush_now()` (wake the log thread, wait until flushed) at each marker.
 - **0155 boot (recovery pull):** steps 1-3 OK: SMMU identity CB8/SMR8 for 0x7b6 (SMR 800007b6 S2CR 8), SE17 GSI mode (dma_mode 1, gsi_ev 0xf), GPII1 ev/ch0/ch1 state 0. Reset during step 4 (ev ALLOC cmd, ev ctx, ev DB, ch ALLOC + ctx). 0156: flushed marker around each command/write with GLOB/GPII IRQ status and error log.
 - **0156 boot:** last line `GPI cmd 0 to ev0: writing 0x27010 (glob 0 gpii 0 err 0x2468083b)`, no "written": the write to GPII1's EV command register resets the phone; GPII1's error log was already non-zero. 0157: read state/err/scratch of every GPII in mask 0xfa, use the first clean one (vayugpii= override), refuse if none.
+- **0157 boot:** GPII1 err 0; GPII3-7 "err" = random values (0x1d6c8252, ...): that register is noise, not ownership. Still reset on the first EV ALLOC write to 0x27010 (GPII1). User: grey screen, then recovery. 0158: gpi_config_interrupts first (TYPE_IRQ_MSK 0x4f, SRC masks, GLOB_IRQ_EN 1, GPII_IRQ_EN 0xf, MSI 0, SCRATCH 0, INTSET 0) with a marker after the first plain write.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

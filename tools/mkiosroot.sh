@@ -121,7 +121,7 @@ fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
 # needs minor repair (1, 0)" under -n on a journaled volume that a -y pass
 # calls OK; trust the -y verdict then.
 if ! fsck.hfsplus -f -n "$out"; then
-	fsck.hfsplus -f -y "$out" | grep -q 'appears to be OK' ||
-		{ echo "fsck: $out is not clean" >&2; exit 1; }
+	verdict=$(fsck.hfsplus -f -y "$out" 2>&1 || true)
+	[[ $verdict == *"appears to be OK"* ]] || { echo "fsck: $out is not clean" >&2; exit 1; }
 	echo "fsck -n flagged only what fsck -y accepts: OK"
 fi

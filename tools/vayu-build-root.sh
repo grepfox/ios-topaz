@@ -22,7 +22,9 @@ done
 img=$dir/ios16-root.img
 fsck_ok() {
 	fsck.hfsplus -f -n "$1" && return 0
-	fsck.hfsplus -f -y "$1" | grep -q 'appears to be OK'	# see mkiosroot.sh
+	local out
+	out=$(fsck.hfsplus -f -y "$1" 2>&1 || true)	# see mkiosroot.sh
+	[[ $out == *"appears to be OK"* ]]
 }
 if [[ ${2:-} == --reuse && -e $img ]]; then
 	echo "reusing $img"

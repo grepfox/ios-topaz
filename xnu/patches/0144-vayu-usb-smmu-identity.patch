@@ -1,0 +1,125 @@
+From 4fce83f330deb48f8994072c59667805ea9c62e8 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 13:10:08 +0200
+Subject: [PATCH] vayu-0144: identity SMMU context for the USB stream
+
+0143 showed the gadget start completing (RUN_STOP, DSTS 0x00020001) but
+the root mount and the log flush stopping right after: USB DMA goes
+through the apps SMMU (0x15000000, stream 0x140) while UFS has no
+stream. Before the controller restarts, point stream 0x140 at a context
+bank with translation off (SCTLR.M=0), as TopazModem does for WLAN, and
+log ABL's entry for the stream. sweetusbsmmu=0 skips it.
+---
+ bsd/dev/sweet_usb.c | 93 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index dfdc6fd..5109532 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -166,9 +166,102 @@ sweet_usb_probe(void)
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
++/*
++ * vayu: USB DMA goes through the apps SMMU (MMU-500 at 0x15000000, stream
++ * 0x140, sm8150-usb.dtsi iommus), unlike UFS (no iommus). ABL's context for
++ * the stream only maps ABL's own buffers; our event buffer and TRBs fault,
++ * and a stalled fault also blocked UFS (root mount and log flush stopped
++ * right after the USB start, 0142/0143). Give the stream an identity
++ * context bank (SCTLR.M=0), as TopazModem does for WLAN on topaz.
++ */
++#define VAYU_SMMU_PA    0x15000000ull
++#define VAYU_SMMU_SIZE  0x00100000u
++#define VAYU_USB_SID    0x140u
++
++static inline uint32_t sm_rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void sm_wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++}
++
++static void
++vayu_usb_smmu_identity(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetusbsmmu", &on, sizeof(on));
++	vm_offset_t s = on ? ml_io_map(VAYU_SMMU_PA, VAYU_SMMU_SIZE) : 0;
++	if (s == 0) {
++		printf("SWEET USB: SMMU left alone\n");
++		return;
++	}
++	uint32_t cr0 = sm_rd(s, 0x0), id0 = sm_rd(s, 0x20), id1 = sm_rd(s, 0x24);
++	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	uint32_t slot = ~0u, cb = ~0u;
++	uint64_t used = 0;
++	printf("SWEET USB: SMMU sCR0 %08x ID0 %08x ID1 %08x sGFSR %08x: %u SMRs %u CBs page %x x%u\n",
++	    cr0, id0, id1, sm_rd(s, 0x48), nsmr, ncb, psize, npage);
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = sm_rd(s, 0x800 + 4 * i), s2cr = sm_rd(s, 0xc00 + 4 * i);
++		uint32_t id = smr & 0xffff, m = (smr >> 16) & 0x7fff;
++		bool valid = (smr >> 31) != 0;
++		if (valid && ((id ^ VAYU_USB_SID) & ~m & 0x7fff) == 0) {
++			uint32_t old = s2cr & 0xff;
++			vm_offset_t ocb = s + (vm_offset_t)npage * psize + (vm_offset_t)old * psize;
++			printf("SWEET USB: SMMU ABL SMR%u %08x S2CR %08x CB%u SCTLR %08x FSR %08x FAR %08x%08x\n",
++			    i, smr, s2cr, old, ((s2cr >> 16) & 3) == 0 && old < ncb ? sm_rd(ocb, 0x0) : 0,
++			    ((s2cr >> 16) & 3) == 0 && old < ncb ? sm_rd(ocb, 0x58) : 0,
++			    ((s2cr >> 16) & 3) == 0 && old < ncb ? sm_rd(ocb, 0x64) : 0,
++			    ((s2cr >> 16) & 3) == 0 && old < ncb ? sm_rd(ocb, 0x60) : 0);
++			if (slot == ~0u) {
++				slot = i;               /* reuse ABL's entry for the stream */
++			}
++		} else if (!valid && slot == ~0u) {
++			slot = i;
++		}
++		if (valid && ((s2cr >> 16) & 3) == 0) {
++			used |= 1ull << (s2cr & 0x3f);
++		}
++	}
++	for (uint32_t i = 4; i < ncb && i < 64; i++) {
++		if ((used & (1ull << i)) == 0) {
++			cb = i;
++			break;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > VAYU_SMMU_SIZE) {
++		printf("SWEET USB: SMMU no free SMR/CB (slot %u cb %u)\n", slot, cb);
++		return;
++	}
++	vm_offset_t gr1 = s + psize, cbp = s + (vm_offset_t)npage * psize + (vm_offset_t)cb * psize;
++	sm_wr(cbp, 0x58, 0xffffffff);           /* FSR: clear */
++	sm_wr(cbp, 0x20, 0);                    /* TTBR0 */
++	sm_wr(cbp, 0x24, 0);
++	sm_wr(cbp, 0x30, 0);                    /* TCR */
++	sm_wr(cbp, 0x10, 0);                    /* TCR2 */
++	sm_wr(cbp, 0x38, 0);                    /* MAIR */
++	sm_wr(cbp, 0x3c, 0);
++	sm_wr(gr1, 0x800 + 4 * cb, 0x00000001); /* CBA2R: VA64 */
++	sm_wr(gr1, 0x000 + 4 * cb, 0x0001f000); /* CBAR: S1 trans S2 fault, WB attrs */
++	sm_wr(cbp, 0x0, 0x000000e0);            /* SCTLR: CFCFG|CFIE|CFRE, M=0: identity */
++	sm_wr(s, 0xc00 + 4 * slot, cb);         /* S2CR: translate via this bank */
++	sm_wr(s, 0x800 + 4 * slot, (1u << 31) | VAYU_USB_SID);  /* SMR valid last */
++	sm_wr(s, 0x70, 0);                      /* sTLBGSYNC */
++	uint32_t n;
++	for (n = 0; n < 100000 && (sm_rd(s, 0x74) & 1) != 0; n++) {
++		delay(1);
++	}
++	printf("SWEET USB: SMMU identity CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x\n", cb, slot,
++	    sm_rd(s, 0x800 + 4 * slot), sm_rd(s, 0xc00 + 4 * slot), sm_rd(cbp, 0x0));
++}
++
+ static void
+ sweet_usb_gadget_thread(void *arg, __unused wait_result_t wr)
+ {
++	if (sweet_soc_vayu()) {
++		vayu_usb_smmu_identity();
++	}
+ 	sweet_usb_gadget_start((vm_offset_t)arg);
+ }
+ 
+-- 
+2.53.0
+

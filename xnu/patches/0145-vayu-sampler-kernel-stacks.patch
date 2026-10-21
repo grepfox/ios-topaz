@@ -1,4 +1,4 @@
-From abe843ede4fb5d0b568e7d534a7f12b7bca98760 Mon Sep 17 00:00:00 2001
+From e1c16ef94f4a2ef8047367c227e972f897486162 Mon Sep 17 00:00:00 2001
 From: grep <noreply@anthropic.com>
 Date: Wed, 21 Oct 2026 13:43:54 +0200
 Subject: [PATCH] vayu-0145: sampler prints kernel state, wait event and kernel
@@ -9,23 +9,22 @@ vm_allocate (mach_vm_allocate trap). Print, per thread, the scheduler
 state, the wait event and (when not running) the saved kernel frame
 chain, unslid, plus free/wired page counts and the kernel slide.
 ---
- osfmk/kern/exception.c | 40 +++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 39 insertions(+), 1 deletion(-)
+ osfmk/kern/exception.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
 
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index a20a764..9eb9a9e 100644
+index a20a764..8b8cd28 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -88,6 +88,8 @@
+@@ -88,6 +88,7 @@
  #include <kern/task_ident.h>
  
  #include <vm/vm_map.h>
-+#include <kern/thread_kernel_state.h>
 +#include <machine/machine_routines.h>
  
  #include <security/mac_mach_internal.h>
  #include <string.h>
-@@ -995,6 +997,7 @@ sweet_crash_strings(const char *name)
+@@ -995,6 +996,7 @@ sweet_crash_strings(const char *name)
   * pointer backtrace of every thread of a task, from the saved user state.
   */
  void sweet_sample_task(const char *name, int pid, task_t task);
@@ -33,7 +32,7 @@ index a20a764..9eb9a9e 100644
  
  void
  sweet_sample_task(const char *name, int pid, task_t task)
-@@ -1009,7 +1012,8 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1009,7 +1011,8 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		slide = sr->sr_slide;
  		vm_shared_region_deallocate(sr);
  	}
@@ -43,7 +42,7 @@ index a20a764..9eb9a9e 100644
  
  	task_lock(task);
  	queue_iterate(&task->threads, thread, thread_t, task_threads) {
-@@ -1018,7 +1022,41 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1018,7 +1021,41 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		int n;
  		uint64_t fp;
  

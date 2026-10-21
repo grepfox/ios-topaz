@@ -11,13 +11,10 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "target.h"	/* IMEM_RESTART_REASON, PSHOLD, GICD/GICR, cpu_mpidr() */
 
-#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0440b000UL
 
-#define GICD_BASE		0x0f200000UL
-#define GICR_BASE		0x0f300000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -59,8 +56,6 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-/* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
-static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
 
 static volatile uint64_t sec_mpidr[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
@@ -241,12 +236,12 @@ static uint64_t speed_ticks(void)
 }
 
 /*
- * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
- * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
+ * A cpufreq-hw domain to its top level before xnu (which has no cpufreq
+ * driver): LUT +0x110 (32-byte rows), PERF_STATE +0x920. topaz: gold
+ * freq-domain1 0xf523000; vayu: the three OSM domains (target.h).
  */
-static void gold_cpufreq_max(void)
+static void cpufreq_max(uintptr_t b)
 {
-	uintptr_t b = 0x0f523000;
 	uint32_t best = 0, best_khz = 0, prev = 0;
 	for (uint32_t i = 0; i < 12; i++) {
 		uint32_t v = rd32(b + 0x110 + i * 0x20);
@@ -264,6 +259,41 @@ static void gold_cpufreq_max(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
 }
+
+static void cpufreq_max_all(void)
+{
+	const uintptr_t dom[] = CPUFREQ_DOMAINS;
+	for (unsigned i = 0; i < sizeof(dom) / sizeof(dom[0]); i++)
+		cpufreq_max(dom[i]);
+}
+
+#if defined(TARGET_VAYU)
+/*
+ * Which MDP source pipe scans ABL's splash, and from where: SRC0_ADDR +0x14,
+ * SRC_YSTRIDE0 +0x24, SRC_FORMAT +0x30 of the eight SSPPs (qcom,sde-sspp-off).
+ * Draw where ABL actually scans out, if that is inside cont_splash_region
+ * with our 1080 x 4-byte stride; otherwise keep FB_BASE.
+ */
+static uint32_t splash_src, splash_stride, splash_format, splash_pipe = 0xff;
+
+static void vayu_find_splash(void)
+{
+	const uint32_t off[8] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
+	for (unsigned i = 0; i < 8; i++) {
+		uintptr_t p = MDSS_BASE + off[i];
+		uint32_t src = rd32(p + 0x14);
+		if (src < FB_BASE || src >= FB_BASE + FB_REGION_SIZE)
+			continue;
+		splash_pipe = i;
+		splash_src = src;
+		splash_stride = rd32(p + 0x24) & 0xffff;
+		splash_format = rd32(p + 0x30);
+		if (splash_stride == FB_STRIDE && src + FB_STRIDE * FB_H <= FB_BASE + FB_REGION_SIZE)
+			con_fb = (volatile uint32_t *)(uintptr_t)src;
+		return;
+	}
+}
+#endif
 
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
@@ -283,7 +313,7 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
-		gold_cpufreq_max();
+		cpufreq_max_all();
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
@@ -507,8 +537,18 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
+#if defined(TARGET_VAYU)
+	vayu_find_splash();
+#endif
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("TARGET", TARGET_NAME);
+#if defined(TARGET_VAYU)
+	/* pipe 0-3 VIG0-3, 4-7 DMA0-3; 0xff: none scans cont_splash_region */
+	con_hex2("SPLASH", "pipe=", splash_pipe, "src=", splash_src);
+	con_hex2("SPLASH", "stride=", splash_stride, "fmt=", splash_format);
+	con_hex("FB", (uintptr_t)con_fb);
+#endif
 	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
@@ -527,6 +567,10 @@ void shim_main(uint64_t dtb)
 		gold_dtb = 0;
 		con_hex("CPU_ON", (uint64_t)r);
 	}
+#if defined(TARGET_VAYU)
+	/* vayu boots on CPU 0 (A55, 16K granule present), like sweet: no hand-off */
+	cpufreq_max_all();
+#endif
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

@@ -4,19 +4,31 @@
 # Cancels runs still queued/running, dispatches xnu.yml for the pushed HEAD of topaz, takes the
 # xnu-kernel artifact as soon as it exists (~6 min; GitHub can show the run "in progress" for
 # half an hour after the job ended), then builds ../shim-boot-NAME-LABEL.img per LABEL.
+#   TARGET=vayu REPO=grepfox/ios-topaz BRANCH=vayu REMOTE=fork VAYU_DTB=... tools/kbuild.sh NAME ...
 set -eu
 cd "$(dirname "$0")/.."
 name=${1:?usage: kbuild.sh NAME [LABEL="boot-args"]...}; shift
-repo=MakrSas/ios-topaz
-base="debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60"
+TARGET=${TARGET:-topaz}
+repo=${REPO:-MakrSas/ios-topaz}
+branch=${BRANCH:-$TARGET}
+remote=${REMOTE:-origin}
+if [ "$TARGET" = vayu ]; then
+  # all eight cores; keys on PM8150; no touch, Wi-Fi or modem on vayu yet
+  base="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30"
+  adt=shim/out/vayu.adt
+  python3 tools/mkadt.py "$adt" --target vayu
+else
+  base="debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60"
+  adt=shim/out/topaz-x2.adt
+fi
 head=$(git rev-parse HEAD)
-[ "$(git rev-parse origin/topaz)" = "$head" ] || { echo "push topaz first" >&2; exit 1; }
+[ "$(git rev-parse "$remote/$branch")" = "$head" ] || { echo "push $branch to $remote first" >&2; exit 1; }
 
 for r in $(gh run list -R $repo -w xnu.yml -L 20 --json databaseId,status -q ".[]|select(.status!=\"completed\")|.databaseId"); do
   gh run cancel -R $repo "$r" >/dev/null 2>&1 || true
 done
 t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-gh workflow run xnu.yml -R $repo --ref topaz
+gh workflow run xnu.yml -R $repo --ref "$branch"
 run=""
 for i in $(seq 30); do
   sleep 4
@@ -43,7 +55,7 @@ rm -rf "$k"; mkdir -p "$k"
 gh run download -R $repo "$run" -n xnu-kernel -D "$k"
 for v in "$@"; do
   label=${v%%=*}; extra=${v#*=}
-  python3 tools/mkpayload.py "$k/kernel.development.sweet" shim/out/topaz-x2.adt "shim/out/payload-$name-$label.bin" --cmdline "$base $extra" >/dev/null
-  (cd shim && ./build.sh "../shim/out/payload-$name-$label.bin" >/dev/null && cp out/shim-boot.img "../../shim-boot-$name-$label.img")
+  python3 tools/mkpayload.py "$k/kernel.development.sweet" "$adt" "shim/out/payload-$name-$label.bin" --cmdline "$base $extra" >/dev/null
+  (cd shim && TARGET=$TARGET ./build.sh "../shim/out/payload-$name-$label.bin" >/dev/null && cp out/shim-boot.img "../../shim-boot-$name-$label.img")
   ls -la "../shim-boot-$name-$label.img"
 done

@@ -13,7 +13,13 @@
 #include "console.h"
 #include "ufs.h"
 
+#include "target.h"
+
+#if defined(TARGET_VAYU)
+#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, vayu stock DTB (same as sweet) */
+#else
 #define UFS_BASE	0x04804000UL	/* ufshc@4804000, topaz live FDT */
+#endif
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -164,6 +170,14 @@ static const char *fs_type(uint32_t lba)
 }
 
 /* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
+/* no libc: clang (unlike gcc) emits a strcmp call for __builtin_strcmp */
+static int str_eq(const char *a, const char *b)
+{
+	while (*a && *a == *b)
+		a++, b++;
+	return *a == *b;
+}
+
 static void list_partitions(uint32_t entry_lba, uint32_t nent)
 {
 	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
@@ -186,8 +200,8 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
 			continue;
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
-		if (!__builtin_strcmp(name, "userdata") || !__builtin_strcmp(name, "cust") ||
-		    !__builtin_strcmp(name, "cache"))
+		if (str_eq(name, "userdata") || str_eq(name, "cust") ||
+		    str_eq(name, "cache"))
 			con_str(" fs", fs_type((uint32_t)first));
 	}
 }

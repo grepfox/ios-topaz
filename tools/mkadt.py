@@ -2,7 +2,14 @@
 """Build the minimal Apple Device Tree that the TOPAZ xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem|--midmem] [--native] [--target topaz|vayu]
+
+--target vayu: Poco X3 Pro (SM8150-AC). MMIO from the stock MIUI 14 DTB
+(SM8150P v2 + VAYU dtbo, the same map as sweet's SM7150); all eight cores;
+RAM from 0xb0000000 (above the last fixed carve-out, ramdump_fb_region
+0xaf000000+16M) through the upper bank. The memory flags do not apply: the
+vayu shim clamps the size to the /memory ranges ABL reports.
 """
 import hashlib, os, struct, sys
 
@@ -43,6 +50,23 @@ QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 
+# vayu (Poco X3 Pro, SM8150-AC, 6 GB). DDR starts at 0x80000000; the fixed
+# reserved-memory carve-outs end at 0xb0000000 (hyp 0x85700000 ... cdsp_sec
+# 0xa4c00000+0x3c00000, ramdump_fb 0xaf000000+16M). 0xb0000000 + 0x14cc00000 =
+# 0x1_fcc00000 mirrors sweet's 6 GB layout (upper bank 0x1_00000000 +
+# 0xfcc00000); shim/loader.c shrinks it if ABL's /memory says less.
+VAYU = dict(
+    PHYS_BASE=0xb0000000, MEM_SIZE=0x14cc00000,
+    GICD=0x17a00000, GICR=0x17a60000,   # interrupt-controller@17a00000, stride 0x20000
+    FB=0x9c000000, FB_SIZE=0x2400000,   # cont_splash_region@9c000000
+    UFS=0x01d84000,                     # ufshc@1d84000
+    ECID=0x564159550000_0001,           # 'VAYU' + 1, synthetic
+)
+# vayu CPUs in physical order (MPIDR Aff1 = core): 4x A55 1.79 GHz,
+# 3x A76 gold 2.42 GHz, 1x A76 prime 2.96 GHz. One homogeneous cluster as
+# on sweet (the scheduler does not know the A76s are faster).
+VAYU_CPU_HZ = [1785600000] * 4 + [2419200000] * 3 + [2956800000]
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -76,11 +100,17 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, target='topaz'):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
+    vayu = target == 'vayu'
+    phys_base, mem_size = ((VAYU['PHYS_BASE'], VAYU['MEM_SIZE']) if vayu and not qemu else
+                           (MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
-    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    gicd, gicr, timebase = ((QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else
+                            (VAYU['GICD'], VAYU['GICR'], TIMEBASE) if vayu else (GICD, GICR, TIMEBASE))
+    fb, fb_size = (VAYU['FB'], VAYU['FB_SIZE']) if vayu else (FB, FB_SIZE)
+    ufs_pa = VAYU['UFS'] if vayu else UFS
+    shim_name = 'vayu-shim' if vayu else 'topaz-shim'
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -91,8 +121,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('topaz-shim')),
-        ('system-firmware-version', cstr('topaz-shim')),
+        ('firmware-version', cstr(shim_name)),
+        ('system-firmware-version', cstr(shim_name)),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -110,7 +140,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', VAYU['ECID'] if vayu else SWEET_ECID)),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -133,8 +163,32 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # VAYU SMP: all eight cores (DynamIQ, MPIDR Aff1 = core 0x000-0x700), as
+    # sweet's SM7150 layout; ABL starts on CPU 0, an A55 with the 16K granule.
     cpu_nodes = []
-    for core in range(1 if qemu else 4):
+    if vayu and not qemu:
+        for core in range(8):
+            cpu_nodes.append(node(f'cpu{core}', [
+                ph(),
+                ('device_type', cstr('cpu')),
+                ('compatible', cstr('qcom,kryo485') + cstr('qcom,kryo470') + cstr('ARM,v8')),
+                ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+                ('cpu-id', u32(core)),
+                ('cluster-id', u32(0)),
+                ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+                ('die-cluster-id', u32(0)),
+                ('cluster-core-id', u32(core)),
+                ('l2-cache-id', u32(core)),  # private L2 per core (DynamIQ)
+                ('l3-cache-id', u32(0)),     # shared L3
+                ('state', cstr('running' if core == 0 else 'stopped')),
+                ('timebase-frequency', u32(timebase)),
+                ('clock-frequency', u32(VAYU_CPU_HZ[core])),
+                ('bus-frequency', u32(100000000)),
+                ('memory-frequency', u32(2133000000)),
+                ('peripheral-frequency', u32(timebase)),
+                ('fixed-frequency', u32(timebase)),
+            ]))
+    for core in range(0 if vayu and not qemu else 1 if qemu else 4):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
@@ -183,11 +237,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # the kernel's AppleCLCD matches the compatible string.
         # launchd starts wifid only when the device tree has a "wlan" node
         # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi)
-        node('wlan', [
+        ] + ([] if vayu else [node('wlan', [
             ph(),
             ('device_type', cstr('wlan')),
             ('compatible', cstr('topaz,wcn3988')),
-        ]),
+        ])]) + [
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
@@ -201,7 +255,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
+        ('reg', u64(fb, fb_size)),
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
@@ -211,7 +265,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('reg', u64(ufs_pa, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -243,7 +297,9 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') +
+         (cstr('xiaomi,vayu') + cstr('xiaomi,sweet') + cstr('qcom,sm8150') if vayu else
+          cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -254,8 +310,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
 
 
 if __name__ == '__main__':
+    target = sys.argv[sys.argv.index('--target') + 1] if '--target' in sys.argv else 'topaz'
+    if target not in ('topaz', 'vayu'):
+        raise SystemExit(f'unknown --target {target} (topaz, vayu)')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv, target=target)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

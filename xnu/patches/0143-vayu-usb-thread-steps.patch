@@ -1,0 +1,99 @@
+From 1d1b1b3ef49e10549e7994e7106ec6a7f1e779c1 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 12:51:29 +0200
+Subject: [PATCH] vayu-0143: USB start in its own thread, with step markers
+
+On vayu (DWC_usb31 1.10a, GSNPSID 0x33313130) the gadget start stopped
+after the soft reset; called from sweet_ufs_init it kept the root from
+mounting. Run it in a kernel thread and log each step (event buffer,
+DCFG/DEVTEN, endpoint 0, setup TRB, RUN_STOP) to find the stall.
+---
+ bsd/dev/sweet_usb.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c1805a2..dfdc6fd 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -38,6 +38,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_soc_vayu(void);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void sweet_usb_gadget_thread(void *arg, wait_result_t wr);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -138,7 +139,14 @@ sweet_usb_probe(void)
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+-		sweet_usb_gadget_start(dwc);
++		/*
++		 * Own thread: on vayu (DWC_usb31 1.10a) the start stalled after the
++		 * soft reset and, run from sweet_ufs_init, kept the root from mounting.
++		 */
++		thread_t gthread;
++		if (kernel_thread_start(sweet_usb_gadget_thread, (void *)dwc, &gthread) == KERN_SUCCESS) {
++			thread_deallocate(gthread);
++		}
+ 	}
+ 	if (vayu) {
+ 		return;         /* SNPS femto PHY: no QUSB2 registers to report */
+@@ -158,6 +166,12 @@ sweet_usb_probe(void)
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
++static void
++sweet_usb_gadget_thread(void *arg, __unused wait_result_t wr)
++{
++	sweet_usb_gadget_start((vm_offset_t)arg);
++}
++
+ /*
+  * Step 2: USB device mode with only the default control endpoint, enough
+  * for the host to enumerate the phone (boot-arg sweetusb=2). ABL leaves
+@@ -869,17 +883,22 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
++	printf("SWEET USB: step 1 event buffer at 0x%llx (GSNPSID 0x%08x VER 0x%08x)\n",
++	    ud.dma_pa + UD_EVT, dwc_rd(0xc120), dwc_rd(0xc1a0));
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
++	printf("SWEET USB: step 2 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x\n",
++	    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(GEVNTSIZ));
+ 
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
++	printf("SWEET USB: step 3 DCFG 0x%08x DEVTEN 0x%08x\n", dwc_rd(DCFG), dwc_rd(DEVTEN));
+ 
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+@@ -890,8 +909,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		printf("SWEET USB: endpoint 0 setup failed\n");
+ 		return;
+ 	}
++	printf("SWEET USB: step 4 endpoint 0 configured\n");
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
++	printf("SWEET USB: step 5 setup TRB queued\n");
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+@@ -905,6 +926,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	printf("SWEET USB: step 6 RUN_STOP\n");
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+-- 
+2.53.0
+

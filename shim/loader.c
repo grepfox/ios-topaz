@@ -83,8 +83,9 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
  * put in /memory (several ranges, with holes where TZ/hyp memory is not
  * listed). Merge adjacent ranges and give xnu the largest contiguous block
  * at or above MEM_MIN_BASE (above every fixed carve-out), 32 MiB aligned.
- * Blocks that start below 4 GiB win (UFS and the display want DMA memory
- * there); xnu takes physBase from boot_args, so the kernel can go anywhere.
+ * A block of at least 1 GiB that starts below 4 GiB wins (UFS and the
+ * display want DMA memory there), else the largest one; xnu takes physBase
+ * from boot_args, so the kernel can go anywhere.
  * Kernel 0145 log: taking only the block that held 0xb0000000 left xnu
  * with 12288 pages (192 MiB) and dyld's first vm_allocate never finished.
  */
@@ -128,7 +129,7 @@ static int mem_pick(uintptr_t dtb, uint64_t *base, uint64_t *size)
 			lo = MEM_MIN_BASE;
 		lo = (lo + MEM_ALIGN - 1) & ~(MEM_ALIGN - 1);
 		end &= ~(MEM_ALIGN - 1);
-		int low = lo < 0x100000000UL;
+		int low = lo < 0x100000000UL && end > lo && end - lo >= 0x40000000UL;
 		if (end > lo && (low > best_low || (low == best_low && end - lo > best_size))) {
 			best_lo = lo;
 			best_size = end - lo;

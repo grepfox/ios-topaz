@@ -103,7 +103,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, target='topaz'):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, target='topaz', touch_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     vayu = target == 'vayu'
     phys_base, mem_size = ((VAYU['PHYS_BASE'], VAYU['MEM_SIZE']) if vayu and not qemu else
@@ -309,15 +309,33 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, targ
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]) +
+       # vayu touch (bsd/dev/vayu_touch.c): the flashless Novatek NT36672C
+       # firmware, Tianma (fw01) and CSOT (fw02) panels. Xiaomi/Novatek
+       # binaries: read from a local kernel build, never committed.
+       ([node('vayu-touch', [ph()] + [(k, v) for k, v in sorted(touch_fw.items())])] if touch_fw else []))
 
 
 if __name__ == '__main__':
     target = sys.argv[sys.argv.index('--target') + 1] if '--target' in sys.argv else 'topaz'
     if target not in ('topaz', 'vayu'):
         raise SystemExit(f'unknown --target {target} (topaz, vayu)')
+    touch_fw = None
+    if '--touch-fw' in sys.argv:
+        # DIR with j20s_novatek_ts_fw01.bin / fw02.bin, e.g. a vayu kernel
+        # build's obj/KERNEL_OBJ/firmware (the kernel tree ships them as .ihex)
+        d = sys.argv[sys.argv.index('--touch-fw') + 1]
+        touch_fw = {}
+        for key in ('fw01', 'fw02'):
+            p = os.path.join(d, f'j20s_novatek_ts_{key}.bin')
+            if os.path.exists(p):
+                touch_fw[key] = open(p, 'rb').read()
+                print(f'{p}: {len(touch_fw[key])} bytes -> /vayu-touch {key}', file=sys.stderr)
+        if not touch_fw:
+            raise SystemExit(f'--touch-fw {d}: no j20s_novatek_ts_fw01.bin / fw02.bin')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv, target=target)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv, target=target,
+                 touch_fw=touch_fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

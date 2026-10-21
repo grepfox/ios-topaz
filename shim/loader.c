@@ -171,6 +171,47 @@ static void mem_cmdline(volatile char *cl, int max)
 	cl[n] = 0;
 }
 
+/*
+ * vayu touch firmware choice, as the Linux nt36672c driver makes it: ABL's
+ * cmdline names the panel in msm_drm.dsi_display0=dsi_j20s_<maker>_..., 36
+ * = Tianma (fw01), 42 = CSOT (fw02). Appends " vayupanel=36|42".
+ */
+static void panel_cmdline(uintptr_t dtb, volatile char *cl, int max)
+{
+	uintptr_t v;
+	uint32_t len;
+	static const char key[] = "dsi_j20s_";
+	int maker = 0;
+	if (!fdt_chosen_prop(dtb, "bootargs", &v, &len)) {
+		con_str("PANEL", "no /chosen/bootargs");
+		return;
+	}
+	volatile const char *s = (volatile const char *)v;
+	for (uint32_t i = 0; i + sizeof(key) + 1 < len; i++) {
+		uint32_t k = 0;
+		while (key[k] && s[i + k] == key[k])
+			k++;
+		if (key[k] == 0) {
+			char a = s[i + k], b = s[i + k + 1];
+			if (a >= '0' && a <= '9' && b >= '0' && b <= '9')
+				maker = (a - '0') * 10 + (b - '0');
+			break;
+		}
+	}
+	con_hex("PANEL", maker);
+	if (maker != 36 && maker != 42)
+		return;
+	int n = 0;
+	while (n < max - 1 && cl[n])
+		n++;
+	const char *tag = " vayupanel=";
+	for (int i = 0; tag[i] && n < max - 4; i++)
+		cl[n++] = tag[i];
+	cl[n++] = '0' + maker / 10;
+	cl[n++] = '0' + maker % 10;
+	cl[n] = 0;
+}
+
 /* ADT property: char name[32], u32 length, value. Device memory: 32-bit accesses only. */
 static void adt_set_u64(uintptr_t adt, uint64_t len, const char *name, uint64_t v)
 {
@@ -298,6 +339,7 @@ const char *loader_boot(uintptr_t dtb)
 		ba->CommandLine[i] = p->cmdline[i];
 #if defined(MEM_FROM_FDT)
 	mem_cmdline(ba->CommandLine, BOOT_LINE_LENGTH);
+	panel_cmdline(dtb, ba->CommandLine, BOOT_LINE_LENGTH);
 #endif
 	ba->memSizeActual = mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);

@@ -156,3 +156,47 @@ int fdt_memory(uintptr_t fdt, struct fdt_range *out, int max)
 		}
 	}
 }
+
+/* Pointer to and length of a /chosen property's value (e.g. "bootargs"); 0 if absent. */
+int fdt_chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val, uint32_t *len)
+{
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	uintptr_t p = fdt + be32(fdt + 8);
+	uintptr_t strings = fdt + be32(fdt + 12);
+	int depth = 0, in_chosen = 0;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			depth++;
+			in_chosen = depth == 2 && streq(name, "chosen");
+			p = align4(skip_str(p));
+			break;
+		}
+		case FDT_END_NODE:
+			if (in_chosen)
+				return 0;
+			depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t l = be32(p), nameoff = be32(p + 4);
+			uintptr_t v = p + 8;
+			if (in_chosen && streq((const char *)(strings + nameoff), prop)) {
+				*val = v;
+				*len = l;
+				return 1;
+			}
+			p = align4(v + l);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return 0;
+		}
+	}
+}

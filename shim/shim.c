@@ -243,7 +243,7 @@ static uint64_t speed_ticks(void)
 static void cpufreq_max(uintptr_t b)
 {
 	uint32_t best = 0, best_khz = 0, prev = 0;
-	for (uint32_t i = 0; i < 12; i++) {
+	for (uint32_t i = 0; i < CPUFREQ_LUT_ROWS; i++) {
 		uint32_t v = rd32(b + 0x110 + i * 0x20);
 		uint32_t khz = ((v >> 30) & 3) ? 19200 * (v & 0xff) : 300000;
 		if (i && khz == prev)

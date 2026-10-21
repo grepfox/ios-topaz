@@ -21,6 +21,8 @@
 #define MDSS_BASE		0x0ae00000UL
 /* cpufreq-hw domains (osm pwrcl / perfcl / perfpcl): A55, A76 gold, A76 prime */
 #define CPUFREQ_DOMAINS		{ 0x18323000UL, 0x18325800UL, 0x18327800UL }
+/* up to 40 LUT rows (silver has ~18 levels; 12 stopped it at 1305 MHz on the phone) */
+#define CPUFREQ_LUT_ROWS	40
 /* DynamIQ: MPIDR Aff1 = core. 0x000-0x300 A55, 0x400-0x600 A76, 0x700 A76 prime */
 static inline unsigned long cpu_mpidr(int i) { return (unsigned long)i << 8; }
 /* Clamp the kernel's RAM to the /memory ranges ABL writes into the DTB */
@@ -36,6 +38,7 @@ static inline unsigned long cpu_mpidr(int i) { return (unsigned long)i << 8; }
 #define FB_BASE			0x5c000000UL	/* reserved-memory cont_splash_region */
 #define FB_REGION_SIZE		0x00f00000UL
 #define CPUFREQ_DOMAINS		{ 0x0f523000UL }	/* gold freq-domain1 */
+#define CPUFREQ_LUT_ROWS	12
 /* CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
 static inline unsigned long cpu_mpidr(int i) { return (unsigned long)(i >> 2) << 8 | (i & 3); }
 #endif

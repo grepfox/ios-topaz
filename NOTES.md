@@ -12,7 +12,8 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - 0140 applies cleanly on xnu-8796.141.3 with the whole series (local check; same skips as CI: 0031, 0041 and blacktop's Sonoma/TrustCache/iobuffermemd patches).
 - Shim builds locally with clang 21 + lld (no aarch64 gcc on this PC): `TARGET=vayu VAYU_DTB=<dump>/boot/dtb.img MKBOOTIMG="python3 <aosp mkbootimg>/mkbootimg.py" shim/build.sh` -> boot v2. topaz ADT output verified byte-identical to before.
 - Unverified guesses: splash is a8r8g8b8 1080x2400 stride 4320 at 0x9c000000 (shim reads the SSPP SRC registers to check); DDR above 4 GiB contiguous up to ~0x1_fcc00000 like sweet's 6 GB (shim clamps to ABL /memory); ABL accepts the payload as boot v2 ramdisk without overlapping 0xb0000000 (loader refuses if it does).
-- Next: user boots the diagnostic shim (no payload) and sends a photo; then kernel cpus=1 read-only.
+- **Diagnostic shim booted on the phone (2026-10-21, photo):** SPLASH pipe=0 (VIG0) src=0x9C000000 stride=0x10E0 fmt=0x000237FF (4 bytes/pixel; colours right), MMFR0 tg16=1, MIDR 0x51DF805E (Kryo 485 Silver) MPIDR 0x81000000 (MT=1, core 0), empty-cpio INITRD at 0x856FE000-0x856FE060 (ABL places the ramdisk just below hyp_mem 0x85700000, far from 0xb0000000). UFS read-only probe OK: LUN0 lastlba 0x1D7D7FF (4K blocks, 128 GB), userdata lba 0x2B8200, 0x1AC55 MiB, fs "other" (f2fs). CPUFREQ only reached 1305/1920/2016 MHz: the LUT walk stopped at 12 rows (topaz value); fixed to 40 rows for vayu (CPUFREQ_LUT_ROWS), images rebuilt. /memory ranges are only printed once a payload is loaded.
+- Next: kernel image `shim-boot-vayu-0140-cpu1.img` (read-only), photo of where it stops; also check the MEM0.. lines and CPUFREQ on the red shim screen before the jump.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

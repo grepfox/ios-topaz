@@ -1,0 +1,196 @@
+From 5f6a50cdfa488b1c768e0eadd3a368cc4b9effd7 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 13:58:07 +0200
+Subject: [PATCH] vayu-0172: backlight via PM8150L WLED (SPMI write channel):
+ off/on with the display, level from DBV; sweetfb_vsync boot-arg (30-120 Hz)
+
+---
+ bsd/dev/sweet_spmi.c                  | 51 ++++++++++++++++++++++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 60 ++++++++++++++++++++++++++-
+ 2 files changed, 108 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index fb7b23d..f4308c2 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -18,6 +18,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
+ #define SP_NO_APID 0xffffu
++#define SP_CHNLS_PA 0x0c600000u  /* "chnls": RW channel of APID n at +0x10000 * n */
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+@@ -92,7 +93,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	 * sid 0: sweet PM6150 SMB5 + QG. sid 2: vayu PM8150B SMB5 (0x10-0x13)
+ 	 * and FG gen4 batt_soc/batt_info (0x40/0x41).
+ 	 */
+-	bool ok = (sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	bool ok = (sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
++	    (sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
+ 	    peripheral == 0x13 || peripheral == 0x48)) ||
+ 	    (sid == 2 && ((peripheral >= 0x10 && peripheral <= 0x13) ||
+ 	    peripheral == 0x40 || peripheral == 0x41));
+@@ -129,4 +131,51 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * One-byte write through the apps RW channel (spmi-pmic-arb v5,
++ * pmic_arb_offset_v5: chnls + 0x10000 * apid; CMD 0x00, STATUS 0x08, WDATA0
++ * 0x10; EXT_WRITEL opcode 0). Only vayu's PM8150L WLED (sid 5, 0xd8/0xd9),
++ * and only when the ownership table gives the APID's writes to EE 0.
++ */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
++{
++	unsigned peripheral = addr >> 8;
++	if (!sp_ready || sid != 5 || (peripheral != 0xd8 && peripheral != 0xd9)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	static vm_offset_t ch[512];
++	if (!ch[apid]) {
++		ch[apid] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	}
++	vm_offset_t c = ch[apid];
++	if (!c) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	*(volatile uint32_t *)(c + 0x10u) = val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(c + 0x00u) = ((addr & 0xffu) << 4);   /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(c, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dabe169..ca707d4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -74,6 +74,36 @@ static void sweet_bl_log(const char *who, OSDictionary *d);
+ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int sweet_soc_vayu(void);       /* osfmk/arm64/sweet_early.c */
++extern "C" int sweet_spmi_init(void);      /* bsd/dev/sweet_spmi.c */
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++
++/*
++ * vayu backlight: PM8150L WLED5 (sid 5, sink 0xd900; qcom-spmi-wled.c,
++ * panel bl_ctrl_wled, 12-bit, modulator A): brightness LSB 0x53 / MSB 0x54
++ * (low nibble), then pulse SYNC bit 0 of 0x65. DCS 0x28/0x51 only blank the
++ * picture on this LCD; the WLED keeps the backlight lit.
++ */
++static bool
++vayu_wled_set(uint32_t level12)
++{
++	if (level12 > 0xfff) {
++		level12 = 0xfff;
++	}
++	uint8_t sync = 0;
++	if (sweet_spmi_read(5, 0xd965, &sync)) {
++		sync = 0;
++	}
++	bool ok = !sweet_spmi_write(5, 0xd953, (uint8_t)level12) &&
++	    !sweet_spmi_write(5, 0xd954, (uint8_t)((level12 >> 8) & 0xf)) &&
++	    !sweet_spmi_write(5, 0xd965, (uint8_t)((sync & ~3u) | 1u)) &&
++	    !sweet_spmi_write(5, 0xd965, (uint8_t)(sync & ~3u));
++	static uint32_t logs;
++	if (logs++ < 12 || !ok) {
++		IOLog("SWEET FB: WLED level %#x: %s\n", level12, ok ? "ok" : "FAILED");
++	}
++	return ok;
++}
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -109,7 +139,9 @@ enum {
+ #define SWEET_FB_MAX_NITS               500     /* IOMFBBrightnessLevel at panel DBV 0x7ff */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
++/* vsync period; boot-arg sweetfb_vsync (Hz, 30..120, default 60) */
++static uint32_t sweet_fb_vsync_us = 16667;
++#define SWEET_FB_VSYNC_US               sweet_fb_vsync_us
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -374,6 +406,16 @@ AppleCLCD::start(IOService *provider)
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
++	if (sweet_soc_vayu() && sweet_spmi_init() == 0) {
++		uint8_t lo = 0, hi = 0, en = 0, ctl = 0;
++		bool rd = !sweet_spmi_read(5, 0xd953, &lo) && !sweet_spmi_read(5, 0xd954, &hi) &&
++		    !sweet_spmi_read(5, 0xd950, &en) && !sweet_spmi_read(5, 0xd846, &ctl);
++		uint32_t cur = ((uint32_t)(hi & 0xf) << 8) | lo;
++		IOLog("SWEET FB: WLED read %s: level %#x mod_a_en %#x ctrl_en %#x\n", rd ? "ok" : "FAILED", cur, en, ctl);
++		if (rd && cur >= 2) {
++			fBlLevel = cur / 2u;            /* keep ABL's brightness */
++		}
++	}
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fDsi != NULL) {
+@@ -457,9 +499,16 @@ AppleCLCD::start(IOService *provider)
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 	}
++	uint32_t vhz = 60;
++	if (PE_parse_boot_argn("sweetfb_vsync", &vhz, sizeof(vhz)) && vhz >= 30 && vhz <= 120) {
++		sweet_fb_vsync_us = 1000000u / vhz;
++	} else {
++		vhz = 60;
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	fFlushTicks = (hz == 0 || hz >= vhz) ? 1 : vhz / hz;
++	IOLog("SWEET FB: vsync %u Hz, panel copy every %u ticks\n", vhz, fFlushTicks);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -728,6 +777,10 @@ AppleCLCD::setPanelOn(bool on)
+ 	uint8_t hdr[4] = { (uint8_t)(on ? 0x29 : 0x28), 0, 0x05, 0x80 };
+ 	IOLockLock(fBlLock);
+ 	bool done = dsiSend(hdr, NULL, 0);
++	if (sweet_soc_vayu()) {
++		/* off: backlight to 0; on: back to the current level (DBV 11-bit -> 12-bit) */
++		(void)vayu_wled_set(on ? fBlLevel * 2u : 0u);
++	}
+ 	IOLockUnlock(fBlLock);
+ 	IOLog("SWEET FB: panel display %s: %s\n", on ? "on" : "off", done ? "done" : "NO DONE");
+ }
+@@ -738,6 +791,9 @@ AppleCLCD::setPanelLevel(uint32_t level)
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+ 	IOLockLock(fBlLock);
+ 	bool done = dsiDcsLong(cmd, sizeof(cmd));
++	if (sweet_soc_vayu()) {
++		done = vayu_wled_set(level * 2u);
++	}
+ 	IOLockUnlock(fBlLock);
+ 	static uint32_t logs;
+ 	if (logs++ < 8 || !done) {
+-- 
+2.53.0
+

@@ -47,8 +47,8 @@ Source: `boot.img` (header v2, kernel offset `0x8000`, ramdisk `0x1000000`, tags
 Kernel (GitHub Actions on the fork):
 
 ```sh
-gh workflow run xnu.yml -R grepfox/ios-topaz --ref vayu
-gh run download RUN_ID -R grepfox/ios-topaz -n xnu-kernel -D xnu/out
+gh workflow run xnu.yml -R grepfox/ios-vayu --ref vayu
+gh run download RUN_ID -R grepfox/ios-vayu -n xnu-kernel -D xnu/out
 ```
 
 Boot image. `VAYU_DTB` is the DTB section of the stock `boot.img` (in the dump: `boot/dtb.img`); it is Xiaomi's, keep it out of git. `MKBOOTIMG` points at AOSP `mkbootimg.py`. Without `aarch64-linux-gnu-gcc` the shim builds with clang + lld.

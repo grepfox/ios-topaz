@@ -4,7 +4,7 @@
 # Cancels runs still queued/running, dispatches xnu.yml for the pushed HEAD of topaz, takes the
 # xnu-kernel artifact as soon as it exists (~6 min; GitHub can show the run "in progress" for
 # half an hour after the job ended), then builds ../shim-boot-NAME-LABEL.img per LABEL.
-#   TARGET=vayu REPO=grepfox/ios-topaz BRANCH=vayu REMOTE=fork VAYU_DTB=... tools/kbuild.sh NAME ...
+#   TARGET=vayu REPO=grepfox/ios-vayu BRANCH=vayu REMOTE=fork VAYU_DTB=... tools/kbuild.sh NAME ...
 set -eu
 cd "$(dirname "$0")/.."
 name=${1:?usage: kbuild.sh NAME [LABEL="boot-args"]...}; shift

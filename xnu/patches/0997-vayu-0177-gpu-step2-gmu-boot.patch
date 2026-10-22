@@ -1,0 +1,430 @@
+From 4e83f535e53d193c2916446536e0353ecdf7bcf3 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 16:42:26 +0200
+Subject: [PATCH] vayu-0177: Adreno 640 step 2 (vayugpu=2): GMU boot - GPU SMMU
+ stage-1 context for GMU stream 5, RSC/PDC microcode, a640_gmu.bin into TCM +
+ cache RAM, HFI queue table, CM3 out of reset (0xBABEFACE), HFI init
+
+---
+ bsd/dev/vayu_gpu.c | 381 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 381 insertions(+)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 5588aa5..01b44f9 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -19,6 +19,10 @@
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_log_flush_now(void);
+@@ -52,6 +56,8 @@ void vayu_gpu_init(void);
+ #define GMU_REG(w)          ((uint32_t)(w) * 4u)
+ 
+ static vm_offset_t vg_gcc, vg_gpu;
++static int vg_level;            /* boot-arg vayugpu: 1 power + reads, 2 + GMU boot */
++static bool vg_step2(void);
+ 
+ static uint32_t
+ rd(vm_offset_t b, uint32_t off)
+@@ -165,6 +171,11 @@ vg_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	    rd(vg_gpu, GMU_REG(0x1F8D0)), rd(vg_gpu, GMU_REG(0x23B05)));
+ 	printf("VAYU GPU: step 1 done\n");
+ 	sweet_log_flush_now();
++	if (vg_level >= 2) {
++		bool booted = vg_step2();
++		printf("VAYU GPU: step 2 %s\n", booted ? "done: GMU running, HFI up" : "FAILED");
++		sweet_log_flush_now();
++	}
+ }
+ 
+ void
+@@ -175,9 +186,379 @@ vayu_gpu_init(void)
+ 	if (!on) {
+ 		return;
+ 	}
++	vg_level = on;
+ 	thread_t t;
+ 	if (kernel_thread_start(vg_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
+ 	}
+ }
++
++/*
++ * ---- step 2: GMU boot (KGSL a6xx_gmu_fw_start, TCM_BOOT cold boot) ----
++ *
++ * GMU address space (kgsl_gmu.c gmu_vma, allocate_gmu_kmem): ITCM 0x0 and
++ * DTCM 0x40000 (16K each, written through registers), ICACHE 0x4000 and
++ * DCACHE 0x44000 (240K each, RAM), uncached kernel slots of 1 MB from
++ * 0x60000000: dummy page, HFI queues (0x60100000), log (0x60200000). The
++ * RAM is reached through the GPU's own SMMU (qsmmu-v500 0x2ca0000), GMU
++ * kernel stream 5 (DT gmu_kernel iommus <&kgsl_smmu 5 0x400>): a stage-1
++ * context like the touch one maps only these pages.
++ */
++#define VG_SMMU_PA      0x02ca0000u
++#define VG_SMMU_SIZE    0x00010000u
++#define VG_GMU_SID      5u
++#define VG_PDC_CFG_PA   0x0b290000u
++#define VG_PDC_SEQ_PA   0x0b490000u
++/* RAM layout (offsets in one contiguous buffer) */
++#define M_L1            0x00000u
++#define M_L2A           0x01000u        /* VA 0 .. 1G */
++#define M_L3A           0x02000u        /* VA 0 .. 2M */
++#define M_L2B           0x03000u        /* VA 1G .. 2G */
++#define M_L3B           0x04000u        /* VA 0x60000000 .. +2M */
++#define M_L3C           0x05000u        /* VA 0x60200000 .. +2M */
++#define M_ICACHE        0x10000u        /* GMU 0x4000, 0x3c000 */
++#define M_DCACHE        0x50000u        /* GMU 0x44000, 0x3c000 */
++#define M_PERSIST       0x90000u        /* GMU 0x60000000, 4K */
++#define M_HFI           0x91000u        /* GMU 0x60100000, 0x5000 */
++#define M_LOG           0x96000u        /* GMU 0x60200000, 4K */
++#define M_SIZE          0x100000u
++#define GMU_HFI_VA      0x60100000u
++#define GMU_LOG_VA      0x60200000u
++
++static vm_offset_t vg_mem, vg_cbp;
++static uint64_t vg_mem_pa;
++
++static void
++vg_map4k(uint32_t va, uint32_t off)
++{
++	volatile uint64_t *l3;
++	if (va < 0x200000u) {
++		l3 = (volatile uint64_t *)(vg_mem + M_L3A);
++	} else if (va >= 0x60000000u && va < 0x60200000u) {
++		l3 = (volatile uint64_t *)(vg_mem + M_L3B);
++	} else {
++		l3 = (volatile uint64_t *)(vg_mem + M_L3C);
++	}
++	/* page, AttrIndx 0 (normal non-cacheable), AP RW any, inner shareable, AF */
++	l3[(va >> 12) & 511] = (vg_mem_pa + off) | (1u << 10) | (3u << 8) | (1u << 6) | 3u;
++}
++
++static void
++vg_mapr(uint32_t va, uint32_t off, uint32_t size)
++{
++	for (uint32_t i = 0; i < size; i += 0x1000) {
++		vg_map4k(va + i, off + i);
++	}
++}
++
++static bool
++vg_smmu_gmu(void)
++{
++	vm_offset_t s = ml_io_map(VG_SMMU_PA, VG_SMMU_SIZE);
++	if (!s) {
++		return false;
++	}
++	uint32_t cr0 = rd(s, 0x0), id0 = rd(s, 0x20), id1 = rd(s, 0x24);
++	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	printf("VAYU GPU: GPU SMMU sCR0 %#x ID0 %#x ID1 %#x sGFSR %#x: %u SMRs %u CBs page %#x x%u\n",
++	    cr0, id0, id1, rd(s, 0x48), nsmr, ncb, psize, npage);
++	uint32_t slot = ~0u, cb = ~0u;
++	uint64_t used = 0;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = rd(s, 0x800 + 4 * i), s2cr = rd(s, 0xc00 + 4 * i);
++		if (smr >> 31) {
++			printf("VAYU GPU: GPU SMMU SMR%u %08x S2CR %08x\n", i, smr, s2cr);
++			if (((s2cr >> 16) & 3) == 0) {
++				used |= 1ull << (s2cr & 0x3f);
++			}
++			if ((((smr & 0x7fff) ^ VG_GMU_SID) & ~((smr >> 16) & 0x7fff)) == 0) {
++				slot = i;               /* reuse an entry for the GMU stream */
++			}
++		} else if (slot == ~0u) {
++			slot = i;
++		}
++	}
++	for (uint32_t i = 0; i < ncb && i < 64; i++) {
++		if (!(used & (1ull << i))) {
++			cb = i;
++			break;
++		}
++	}
++	sweet_log_flush_now();
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > VG_SMMU_SIZE) {
++		printf("VAYU GPU: GPU SMMU no free SMR/CB (slot %u cb %u)\n", slot, cb);
++		return false;
++	}
++	vm_offset_t gr1 = s + psize, cbp = s + (vm_offset_t)npage * psize + (vm_offset_t)cb * psize;
++	volatile uint64_t *l1 = (volatile uint64_t *)(vg_mem + M_L1);
++	volatile uint64_t *l2a = (volatile uint64_t *)(vg_mem + M_L2A);
++	volatile uint64_t *l2b = (volatile uint64_t *)(vg_mem + M_L2B);
++	l1[0] = (vg_mem_pa + M_L2A) | 3u;
++	l1[1] = (vg_mem_pa + M_L2B) | 3u;
++	l2a[0] = (vg_mem_pa + M_L3A) | 3u;
++	l2b[(0x60000000u >> 21) & 511] = (vg_mem_pa + M_L3B) | 3u;
++	l2b[(0x60200000u >> 21) & 511] = (vg_mem_pa + M_L3C) | 3u;
++	vg_mapr(0x4000u, M_ICACHE, 0x3c000u);
++	vg_mapr(0x44000u, M_DCACHE, 0x3c000u);
++	vg_mapr(0x60000000u, M_PERSIST, 0x1000u);
++	vg_mapr(GMU_HFI_VA, M_HFI, 0x5000u);
++	vg_mapr(GMU_LOG_VA, M_LOG, 0x1000u);
++	flush_dcache64((addr64_t)vg_mem_pa, M_SIZE, TRUE);
++	wr(cbp, 0x0, 0);
++	wr(cbp, 0x58, 0xffffffffu);
++	wr(gr1, 0x800 + 4 * cb, 1u);                    /* CBA2R VA64 */
++	wr(gr1, 4 * cb, 0x0001f000u);                   /* CBAR S1, S2 bypass */
++	wr(cbp, 0x20, (uint32_t)(vg_mem_pa + M_L1));
++	wr(cbp, 0x24, (uint32_t)((vg_mem_pa + M_L1) >> 32));
++	wr(cbp, 0x28, 0);
++	wr(cbp, 0x2c, 0);
++	wr(cbp, 0x30, 25u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23));   /* 39-bit, 4K, EPD1 */
++	wr(cbp, 0x10, 2u | (1u << 4) | (7u << 15));    /* TCR2: 40-bit PA, AS, SEP_UPSTREAM */
++	wr(cbp, 0x38, 0x44u);                           /* MAIR attr0: normal non-cacheable */
++	wr(cbp, 0x3c, 0);
++	wr(cbp, 0x618, 0);
++	wr(cbp, 0x7f0, 0);
++	for (unsigned n = 0; n < 100000 && (rd(cbp, 0x7f4) & 1u); n++) {
++		delay(1);
++	}
++	wr(cbp, 0x0, 0x21);                             /* M, CFRE */
++	wr(s, 0xc00 + 4 * slot, cb);
++	wr(s, 0x800 + 4 * slot, (1u << 31) | (0x400u << 16) | VG_GMU_SID);   /* mask 0x400 as in the DT */
++	wr(s, 0x70, 0);
++	for (unsigned n = 0; n < 100000 && (rd(s, 0x74) & 1u); n++) {
++		delay(1);
++	}
++	printf("VAYU GPU: GPU SMMU GMU stream %u -> CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x TCR2 %08x\n",
++	    VG_GMU_SID, cb, slot, rd(s, 0x800 + 4 * slot), rd(s, 0xc00 + 4 * slot), rd(cbp, 0x0), rd(cbp, 0x10));
++	vg_cbp = cbp;
++	sweet_log_flush_now();
++	return true;
++}
++
++static void
++gmu_wr(uint32_t word, uint32_t v)
++{
++	wr(vg_gpu, word * 4u, v);
++}
++
++static uint32_t
++gmu_rd(uint32_t word)
++{
++	return rd(vg_gpu, word * 4u);
++}
++
++/* _load_gmu_rpmh_ucode (A640 values) */
++static bool
++vg_rpmh_ucode(void)
++{
++	vm_offset_t cfg = ml_io_map(VG_PDC_CFG_PA, 0x10000), seq = ml_io_map(VG_PDC_SEQ_PA, 0x10000);
++	if (!cfg || !seq) {
++		return false;
++	}
++	gmu_wr(0x23404, 1u << 24);              /* RSCC_RSC_STATUS0_DRV0: no SDE clock gating */
++	gmu_wr(0x2340B, 1);                     /* PDC_SLAVE_ID_DRV0 */
++	gmu_wr(0x2340E, 0);
++	gmu_wr(0x2340D, 0);
++	gmu_wr(0x2340E + 2, 0);
++	gmu_wr(0x2340D + 2, 0);
++	gmu_wr(0x2340E + 4, 0x80000000u);
++	gmu_wr(0x2340D + 4, 0);
++	gmu_wr(0x23500, 0);                     /* OVERRIDE_START_ADDR */
++	gmu_wr(0x23408, 0x4520);                /* PDC_SEQ_START_ADDR */
++	gmu_wr(0x23409, 0x4510);                /* PDC_MATCH_VALUE_LO */
++	gmu_wr(0x2340A, 0x4514);                /* PDC_MATCH_VALUE_HI */
++	static const uint32_t rsc[5] = { 0xA7A506A0, 0xA1E6A6E7, 0xA2E081E1, 0xE9A982E2, 0x0020E8A8 };
++	static const uint32_t pdc[5] = { 0xFEBEA1E1, 0xA5A4A3A2, 0x8382A6E0, 0xBCE3E284, 0x002081FC };
++	for (unsigned i = 0; i < 5; i++) {
++		gmu_wr(0x23580 + i, rsc[i]);    /* RSCC_SEQ_MEM_0_DRV0 */
++		wr(seq, 4u * i, pdc[i]);        /* PDC_GPU_SEQ_MEM_0 */
++	}
++	/* TCS1 / TCS3 (sleep / wake), A640: third command addr 0x30090 */
++	wr(cfg, 4u * 0x1573, 7);
++	wr(cfg, 4u * 0x1574, 0);
++	wr(cfg, 4u * 0x1572, 0);
++	wr(cfg, 4u * 0x1575, 0x10108);
++	wr(cfg, 4u * 0x1576, 0x30010);
++	wr(cfg, 4u * 0x1577, 1);
++	wr(cfg, 4u * (0x1575 + 4), 0x10108);
++	wr(cfg, 4u * (0x1576 + 4), 0x30000);
++	wr(cfg, 4u * (0x1577 + 4), 0);
++	wr(cfg, 4u * (0x1575 + 8), 0x10108);
++	wr(cfg, 4u * (0x1576 + 8), 0x30090);
++	wr(cfg, 4u * (0x1577 + 8), 0);
++	wr(cfg, 4u * 0x15D7, 7);
++	wr(cfg, 4u * 0x15D8, 0);
++	wr(cfg, 4u * 0x15D6, 0);
++	wr(cfg, 4u * 0x15D9, 0x10108);
++	wr(cfg, 4u * 0x15DA, 0x30010);
++	wr(cfg, 4u * 0x15DB, 2);
++	wr(cfg, 4u * (0x15D9 + 4), 0x10108);
++	wr(cfg, 4u * (0x15DA + 4), 0x30000);
++	wr(cfg, 4u * (0x15DB + 4), 3);
++	wr(cfg, 4u * (0x15D9 + 8), 0x10108);
++	wr(cfg, 4u * (0x15DA + 8), 0x30090);
++	wr(cfg, 4u * (0x15DB + 8), 3);
++	wr(cfg, 4u * 0x1148, 0);                /* PDC_GPU_SEQ_START_ADDR */
++	wr(cfg, 4u * 0x1140, 0x80000001u);      /* PDC_GPU_ENABLE_PDC */
++	return true;
++}
++
++/* load_gmu_fw: gmu_block_header {addr, size, type, value} + data */
++static bool
++vg_load_gmu_fw(void)
++{
++	DTEntry e;
++	const void *p = NULL;
++	unsigned int sz = 0;
++	if (SecureDTLookupEntry(NULL, "/vayu-gpu", &e) != kSuccess ||
++	    SecureDTGetProperty(e, "gmu", &p, &sz) != kSuccess || sz < 16) {
++		printf("VAYU GPU: no /vayu-gpu gmu in the ADT (mkadt.py --gpu-fw)\n");
++		return false;
++	}
++	const uint8_t *fw = p, *end = fw + sz;
++	unsigned blocks = 0;
++	while (fw + 16 <= end) {
++		uint32_t addr, size;
++		memcpy(&addr, fw, 4);
++		memcpy(&size, fw + 4, 4);
++		fw += 16;
++		if (size == 0) {
++			continue;
++		}
++		if (fw + size > end || (size & 3)) {
++			printf("VAYU GPU: gmu fw block %#x+%#x malformed\n", addr, size);
++			return false;
++		}
++		if (addr + size <= 0x4000u) {
++			for (uint32_t i = 0; i < size; i += 4) {
++				uint32_t w;
++				memcpy(&w, fw + i, 4);
++				gmu_wr(0x1B400 + (addr + i) / 4, w);    /* CM3_ITCM_START */
++			}
++		} else if (addr >= 0x40000u && addr + size <= 0x44000u) {
++			for (uint32_t i = 0; i < size; i += 4) {
++				uint32_t w;
++				memcpy(&w, fw + i, 4);
++				gmu_wr(0x1C400 + (addr - 0x40000u + i) / 4, w);  /* CM3_DTCM_START */
++			}
++		} else if (addr >= 0x4000u && addr + size <= 0x40000u) {
++			memcpy((void *)(vg_mem + M_ICACHE + (addr - 0x4000u)), fw, size);
++		} else if (addr >= 0x44000u && addr + size <= 0x80000u) {
++			memcpy((void *)(vg_mem + M_DCACHE + (addr - 0x44000u)), fw, size);
++		} else {
++			printf("VAYU GPU: gmu fw block %#x+%#x has no backing\n", addr, size);
++			return false;
++		}
++		fw += size;
++		blocks++;
++	}
++	flush_dcache64((addr64_t)vg_mem_pa, M_SIZE, TRUE);
++	printf("VAYU GPU: gmu fw %u bytes, %u blocks loaded\n", sz, blocks);
++	return true;
++}
++
++/* hfi_init: queue table + 4 queue headers, queues of 4K after ALIGN(216, 16) */
++static void
++vg_hfi_init(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(vg_mem + M_HFI);
++	static const uint32_t q[4][3] = { {0, 10, 1}, {1, 10, 1}, {2, 40, 1}, {3, 20, 0} };   /* idx, prio, status */
++	t[0] = 0;                       /* version */
++	t[1] = 216 / 4;                 /* table size, dwords */
++	t[2] = 24 / 4;                  /* qhdr0 offset */
++	t[3] = 48 / 4;                  /* qhdr size */
++	t[4] = 4;                       /* num_q */
++	t[5] = 4;                       /* num_active_q */
++	for (unsigned i = 0; i < 4; i++) {
++		volatile uint32_t *h = t + 6 + 12 * i;
++		h[0] = q[i][2];                                 /* status */
++		h[1] = GMU_HFI_VA + 224 + i * 0x1000;           /* start_addr */
++		h[2] = (q[i][0] & 0xff) | ((q[i][1] & 0xff) << 8);
++		h[3] = 0x1000 / 4;                              /* queue size, dwords */
++		h[4] = 0;
++		h[5] = 0;
++		h[6] = 1;                                       /* rx_wm */
++		h[7] = 1;                                       /* tx_wm */
++		h[8] = 1;                                       /* rx_req */
++		h[9] = 0;
++		h[10] = 0;
++		h[11] = 0;
++	}
++	flush_dcache64((addr64_t)(vg_mem_pa + M_HFI), 0x5000, TRUE);
++}
++
++static bool
++vg_step2(void)
++{
++	printf("VAYU GPU: step 2 start (GMU boot)\n");
++	sweet_log_flush_now();
++	if (kmem_alloc_contig(kernel_map, &vg_mem, M_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("VAYU GPU: no memory\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)vg_mem);
++	if (!pn) {
++		return false;
++	}
++	vg_mem_pa = ptoa_64(pn);
++	printf("VAYU GPU: step 2a: GMU RAM %#llx\n", vg_mem_pa);
++	if (!vg_smmu_gmu()) {
++		return false;
++	}
++	gmu_wr(0x1F9CC, 1);                     /* GENERAL_7: TCM retention */
++	if (!vg_rpmh_ucode()) {
++		printf("VAYU GPU: PDC map failed\n");
++		return false;
++	}
++	printf("VAYU GPU: step 2b: RSC/PDC microcode written\n");
++	sweet_log_flush_now();
++	if (!vg_load_gmu_fw()) {
++		return false;
++	}
++	vg_hfi_init();
++	gmu_wr(0x1F81C, 0);                     /* CM3_FW_INIT_RESULT */
++	gmu_wr(0x1F801, 2);                     /* CM3_BOOT_CONFIG = TCM_BOOT */
++	gmu_wr(0x1F985, GMU_HFI_VA);            /* HFI_QTBL_ADDR */
++	gmu_wr(0x1F984, 1);                     /* HFI_QTBL_INFO */
++	gmu_wr(0x23B11, (1u << 31) | ((0xAu << 2) << 18) | 0x8A0u);   /* AHB_FENCE_RANGE_0 */
++	gmu_wr(0x1F82D, 0x4052);                /* CM3_CFG reset value */
++	gmu_wr(0x1F982, 0x06040000u | (0u << 12) | (1u << 8));   /* HFI_SFR_ADDR: chipid 0x6040001 */
++	gmu_wr(0x1F900, GMU_LOG_VA | 0u);       /* PWR_COL_CP_MSG: log, 1 x 4K */
++	/* a6xx_gmu_power_config (no IFPC/NAP yet) */
++	gmu_wr(0x1F40F, 1);                     /* SYS_BUS_CONFIG */
++	gmu_wr(0x1F400, 1);                     /* ICACHE_CONFIG */
++	gmu_wr(0x1F401, 1);                     /* DCACHE_CONFIG */
++	gmu_wr(0x1F8C0, 0x9C40400u);            /* PWR_COL_INTER_FRAME_CTRL */
++	gmu_wr(0x1F8E8, gmu_rd(0x1F8E8) | 0xF11u);   /* RPMH_CTRL |= RPMH_ENABLE_MASK */
++	printf("VAYU GPU: step 2c: releasing the GMU (sysreset %#x)\n", gmu_rd(0x1F800));
++	sweet_log_flush_now();
++	gmu_wr(0x1F802, 0);                     /* CX_GMU_WFI_CONFIG */
++	gmu_wr(0x1F800, 0);                     /* CM3_SYSRESET: out of reset */
++	uint32_t res = 0;
++	for (unsigned i = 0; i < 1000; i++) {
++		res = gmu_rd(0x1F81C);
++		if (res == 0xBABEFACEu) {
++			break;
++		}
++		delay(100);
++	}
++	printf("VAYU GPU: step 2d: FW_INIT_RESULT %#x (%s), SMMU FSR %#x FAR %#x\n", res,
++	    res == 0xBABEFACEu ? "GMU booted" : "no boot", rd(vg_cbp, 0x58), rd(vg_cbp, 0x60));
++	sweet_log_flush_now();
++	if (res != 0xBABEFACEu) {
++		gmu_wr(0x1F800, 1);             /* back into reset */
++		return false;
++	}
++	gmu_wr(0x1F986, 1);                     /* HFI_CTRL_INIT */
++	uint32_t st = 0;
++	for (unsigned i = 0; i < 1000 && !((st = gmu_rd(0x1F980)) & 1u); i++) {
++		delay(100);
++	}
++	printf("VAYU GPU: step 2e: HFI_CTRL_STATUS %#x, HFI_VERSION %#x, AO irq %#x, log %08x %08x\n", st,
++	    gmu_rd(0x1F981), gmu_rd(0x23B05), *(volatile uint32_t *)(vg_mem + M_LOG),
++	    *(volatile uint32_t *)(vg_mem + M_LOG + 4));
++	return (st & 1u) != 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.53.0
+

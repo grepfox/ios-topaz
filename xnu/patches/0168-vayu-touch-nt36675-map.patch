@@ -1,0 +1,59 @@
+From 0ca65be0dc5f0e82a5879dd2a7df598be07db7c6 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 13:11:24 +0200
+Subject: [PATCH] vayu-0168: NT36675 memory map for trim id 0c..72 66 03 (event
+ buf 0x22D00, hw_crc 2 3-byte CRC lengths)
+
+---
+ bsd/dev/vayu_touch.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 7e7e39b..92f1507 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -123,7 +123,15 @@ void vayu_touch_init(void);
+ #define NVT_SWRST_N8     0x3F0FEu        /* novatek,swrst-n8-addr */
+ #define NVT_SPI_RD_FAST  0x3F310u        /* novatek,spi-rd-fast-addr */
+ #define NVT_ENG_RST      0x7FFF80u
+-#define NVT_EVENT_BUF    0x21C00u
++/*
++ * Event buffer and hw_crc level depend on the trim id (nt36xxx_mem_map.h):
++ * 0b/0a.. 72 66 03 = NT36672A map (0x21C00, hw_crc 1); 0c .. 72 66 03 =
++ * NT36675 map (0x22D00, hw_crc 2, 3-byte CRC lengths). vayu's NT36672C
++ * reads 0c 00 00 72 66 03 (0167).
++ */
++static uint32_t nvt_ev_buf = 0x21C00u;
++static unsigned nvt_hw_crc = 1;
++#define NVT_EVENT_BUF    nvt_ev_buf
+ #define NVT_BOOT_RDY     0x3F10Du
+ #define NVT_ILM_LEN      0x3F118u
+ #define NVT_DLM_LEN      0x3F130u
+@@ -1114,6 +1122,12 @@ nvt_chip_id(void)
+ 		    b[1], b[2], b[3], b[4], b[5], b[6], err);
+ 		/* NT36672A memory map family (trim table: xx ff ff 72/82 66 03) */
+ 		if (err == 0 && (b[4] == 0x72 || b[4] == 0x82) && b[5] == 0x66 && b[6] == 0x03) {
++			if (b[1] == 0x0c && b[4] == 0x72) {
++				nvt_ev_buf = 0x22D00u;
++				nvt_hw_crc = 2;
++			}
++			printf("VAYU TOUCH: memory map %s (event buf %#x, hw_crc %u)\n",
++			    nvt_hw_crc == 2 ? "NT36675" : "NT36672A", nvt_ev_buf, nvt_hw_crc);
+ 			return 0;
+ 		}
+ 		vt_sleep(10);
+@@ -1219,8 +1233,9 @@ nvt_crc_bank(uint32_t des, uint32_t sram, uint32_t len_addr, uint32_t size, uint
+ 	(void)nvt_set_page(des);
+ 	b[0] = des & 0x7f; b[1] = (uint8_t)sram; b[2] = (uint8_t)(sram >> 8); b[3] = (uint8_t)(sram >> 16);
+ 	(void)nvt_write(b, 4);
+-	b[0] = len_addr & 0x7f; b[1] = (uint8_t)size; b[2] = (uint8_t)(size >> 8);
+-	(void)nvt_write(b, 3);          /* hw_crc 1: 2-byte length */
++	b[0] = len_addr & 0x7f; b[1] = (uint8_t)size; b[2] = (uint8_t)(size >> 8); b[3] = (uint8_t)((size >> 16) & 1u);
++	/* hw_crc 1: 2-byte length; hw_crc 2: 3 bytes (0167: ILM 0x12fcf failed its CRC as 0x2fcf) */
++	(void)nvt_write(b, nvt_hw_crc == 2 ? 4 : 3);
+ 	b[0] = gsum & 0x7f; b[1] = (uint8_t)crc; b[2] = (uint8_t)(crc >> 8); b[3] = (uint8_t)(crc >> 16); b[4] = (uint8_t)(crc >> 24);
+ 	(void)nvt_write(b, 5);
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,210 @@
+From a4a4e1643e4917e221b2259756f793e111f330b8 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 09:18:33 +0200
+Subject: [PATCH] vayu-0162: RPMh BCM QUP0 vote before the touch GPI (GPII
+ reported BUS_ERROR)
+
+---
+ bsd/dev/sweet_rpmh.c | 69 +++++++++++++++++++++++++++++++++++---------
+ bsd/dev/vayu_touch.c | 20 ++++++++++++-
+ 2 files changed, 74 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..4e9dcfc 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_bcm_vote(const char *res, unsigned x, unsigned y);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -44,6 +45,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -159,7 +161,7 @@ rh_map(void)
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned want, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -186,9 +188,9 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != want || (addr >> 16) != want || (want == RH_VRM && (addr & 15u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid entry for %s (slave %u addr %#x, want %u)\n", res, slave, addr, want);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -219,7 +221,7 @@ rh_free(unsigned t)
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(uint32_t address, unsigned n, const uint32_t *offsets, const uint32_t *values)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -266,11 +268,10 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	uint32_t mask = (1u << n) - 1u;
++	printf("SWEET RPMH: TCS%u ACTIVE addr %#x, %u commands (first data %#x), irq-enable=%#x\n",
++	    t, address, n, values[0], irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+@@ -278,7 +279,7 @@ rh_send(uint32_t address, unsigned mv)
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +290,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,7 +321,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote to %#x complete\n", address);
+ 	return 0;
+ }
+ 
+@@ -343,10 +344,13 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t offsets[3] = {0, 8, 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(address, 3, offsets, values);
+ 	}
+ out:
+ 	if (error) {
+@@ -355,4 +359,41 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * One ACTIVE bus clock manager vote (BCM_TCS_CMD: commit, valid, vote_x, vote_y).
++ * vayu touch: "QUP0" keeps the QUPv3 masters' NoC port clocked so the GPI
++ * DMA engine can reach DDR (without it the GPI reports BUS_ERROR).
++ */
++int
++sweet_rpmh_bcm_vote(const char *res, unsigned x, unsigned y)
++{
++	if (!res || x > 0x3fffu || y > 0x3fffu) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_BCM, &address);
++	}
++	if (!error) {
++		const uint32_t offsets[1] = {0};
++		const uint32_t values[1] = {(1u << 30) | (1u << 29) | (x << 14) | y};
++		error = rh_send(address, 1, offsets, values);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: BCM %s vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index efaf23b..b7d581b 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -214,6 +214,7 @@ static struct {
+ } vg;
+ 
+ static bool vg_init(void);
++extern int sweet_rpmh_bcm_vote(const char *res, unsigned x, unsigned y);
+ static int vg_spi(const uint8_t *tx, uint8_t *rx, unsigned len);
+ 
+ static uint32_t
+@@ -614,6 +615,21 @@ vg_init(void)
+ 	if (!vt_smmu_identity(VT_GPI_SID)) {
+ 		return false;
+ 	}
++	/*
++	 * 0161: GPII_IRQ_STTS BUS_ERROR (0x2) right after the event ring
++	 * doorbell, TX channel stuck in state 5. The QUP masters' NoC port is
++	 * clocked by BCM "QUP0", which nothing votes here (Android: msm_bus).
++	 * vayuqupbcm=0 skips the vote.
++	 */
++	int bcm = 1;
++	(void)PE_parse_boot_argn("vayuqupbcm", &bcm, sizeof(bcm));
++	if (bcm) {
++		printf("VAYU TOUCH: GPI step 1b: RPMh BCM QUP0 vote\n");
++		sweet_log_flush_now();
++		int e = sweet_rpmh_bcm_vote("QUP0", 1, 1);
++		printf("VAYU TOUCH: BCM QUP0 vote -> %d\n", e);
++		sweet_log_flush_now();
++	}
+ 	printf("VAYU TOUCH: GPI step 2: SE17 to GSI mode\n");
+ 	sweet_log_flush_now();
+ 	/* SE17 to GSI mode (geni_se_select_gsi_mode) */
+@@ -728,7 +744,9 @@ vg_init(void)
+ 	printf("VAYU TOUCH: GPI step 4c: event doorbell\n");
+ 	sweet_log_flush_now();
+ 	vt_wr(vg.gpi, GPI_EV_DB, (uint32_t)(vg.pa + VD_EVR + 16u * vg.ev_wp));
+-	printf("VAYU TOUCH: GPI step 4d: event ring ready (err %#x)\n", vt_rd(vg.gpi, GPI_ERR_LOG));
++	delay(100);
++	printf("VAYU TOUCH: GPI step 4d: event ring ready (err %#x, gpii irq %#x)\n", vt_rd(vg.gpi, GPI_ERR_LOG),
++	    vt_rd(vg.gpi, 0x23118u + 0x4000u * VT_GPII));
+ 	sweet_log_flush_now();
+ 	/* channels: 0 = TX (OUT), 1 = RX (IN), paired, protocol SPI (1), SE 0 */
+ 	for (unsigned k = 0; k < 2; k++) {
+-- 
+2.53.0
+

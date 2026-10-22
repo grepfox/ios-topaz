@@ -77,6 +77,9 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - **0169:** GPI touch on by default (`vayutouchgpi=0` disables). Pending CI + image.
 - User 2026-10-22: everything laggy (no GPU: CoreAnimation renders on the CPU, Adreno 640 not started). Plan agreed: check real CPU clocks, try `sweetfb_hz=60`, then battery and other bugs.
 - **0170:** `SWEET SPEED[0/1]` at ~40 s and ~180 s after touch start: each domain's PERF_STATE (+0x920), its LUT row -> MHz, and a measured MHz per CPU (16 dependent adds per loop vs mach_absolute_time, thread bound per CPU). Code in osfmk/kern/exception.c (`sweet_speed_start`, needs cpu_to_processor/thread_bind), started from vayu_touch_init.
+- **0171:** SweetBattery on vayu reads PM8150B over SPMI sid 2 (DT dtbo 06 VAYU: pm8150b@2 SMB5 0x1000-0x1600, FG gen4 batt_soc 0x4000 / batt_info 0x4100): MSOC 0x4009 (=0x400a shadow, 0..255), VBATT 0x41a0 x122.07 uV (copy 0x41a6), IBATT 0x41a2 signed x488.281 uA (copy 0x41a8), charger state 0x1006/0x1007, power path 0x110b, USBIN 0x1310. sweet_spmi_read allows sid 2 peripherals 0x10-0x13, 0x40, 0x41. `sweetbattery=0` -> static. Log line `SWEET BATTERY: vayu FG ...` every 30 polls (10 s).
+- **One CI build for 0169-0171** (user: don't flood the workflow). Images from it: normal (sweetfb_hz=30) and fb60 (sweetfb_hz=60).
+- Storage: iOS shows 17 GB because tools/vayu-build-root.sh built a 16 GiB HFS+ volume. Added `ROOT_SIZE` (full userdata = 109637M, 16 MiB short of the end for the 4 MiB + 4 KiB log ring). Rebuild + reflash of userdata erases the current iOS install: needs the user's go-ahead.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

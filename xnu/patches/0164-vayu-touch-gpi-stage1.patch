@@ -1,15 +1,15 @@
-From 8e3091449af278b066f4cf1664de8e4c1af64cb7 Mon Sep 17 00:00:00 2001
+From 371c6ae9a355c5318af57635fbb27b5f64b20bcf Mon Sep 17 00:00:00 2001
 From: grep <grepfox@tutamail.com>
 Date: Thu, 22 Oct 2026 10:06:04 +0200
 Subject: [PATCH] vayu-0164: touch GPI stage-1 SMMU context mapping only the
  DMA buffer (Linux smmu-cfg 1); fault readback
 
 ---
- bsd/dev/vayu_touch.c | 72 +++++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 68 insertions(+), 4 deletions(-)
+ bsd/dev/vayu_touch.c | 73 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 69 insertions(+), 4 deletions(-)
 
 diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
-index 51f7fbf..d54b3de 100644
+index 51f7fbf..3ca5298 100644
 --- a/bsd/dev/vayu_touch.c
 +++ b/bsd/dev/vayu_touch.c
 @@ -180,7 +180,9 @@ void vayu_touch_init(void);
@@ -23,10 +23,35 @@ index 51f7fbf..d54b3de 100644
  #define VD_RING_N        32u
  #define VD_EV_N          64u
  /* SE in GSI mode (qcom-geni-se.c geni_se_select_gsi_mode) */
-@@ -496,6 +498,56 @@ vt_smmu_identity(uint32_t sid)
- 		return false;
+@@ -450,6 +452,7 @@ vt_spi(const uint8_t *tx, uint8_t *rx, unsigned len)
+  * keeps high banks for itself.
+  */
+ static vm_offset_t vg_smmu, vg_cbp;
++static void vg_sync(uint32_t off, uint32_t len);
+ 
+ static bool
+ vt_smmu_identity(uint32_t sid)
+@@ -507,7 +510,15 @@ vt_smmu_identity(uint32_t sid)
+ 	 * context bank sweet_usb.c set up for USB stream 0x140 (CB4), which
+ 	 * demonstrably reaches DDR. 0 = own CB from 8 up (resets), 1 bypass, 2 fault.
+ 	 */
+-	int mode = 3;
++	/*
++	 * 0163: sharing USB's identity CB4 also reset at EV ALLOCATE. Every
++	 * mode where the GPI reaches memory resets there, so the GPI likely
++	 * touches some address besides our rings. Mode 4 (default) is what
++	 * Linux does (qcom,smmu-cfg = 1): a real stage-1 context. Only the 2M
++	 * blocks holding our buffer are mapped (IOVA = PA); anything else is a
++	 * context fault (terminate, no stall, no IRQ) that we read back.
++	 */
++	int mode = 4;
+ 	(void)PE_parse_boot_argn("vayugpismmu", &mode, sizeof(mode));
+ 	printf("VAYU TOUCH: SMMU before: sGFSR %#x sCR0 %#x mode %d\n", vt_rd(s, 0x48), vt_rd(s, 0x0), mode);
+ 	if (mode == 3) {
+@@ -536,6 +547,56 @@ vt_smmu_identity(uint32_t sid)
+ 		    vt_rd(s + psize, 4 * ucb), vt_rd(ucbp, 0x58));
+ 		return true;
  	}
- 	vm_offset_t gr1 = s + psize, cbp = s + (vm_offset_t)npage * psize + (vm_offset_t)cb * psize;
 +	if (mode == 4) {
 +		uint64_t lo = vg.pa & ~0x1fffffull, hi = (vg.pa + VD_SIZE - 1) & ~0x1fffffull;
 +		if ((lo >> 30) != (hi >> 30)) {
@@ -77,27 +102,10 @@ index 51f7fbf..d54b3de 100644
 +		    vt_rd(gr1, 4 * cb), vt_rd(cbp, 0x30), vt_rd(cbp, 0x24), vt_rd(cbp, 0x20), lo, hi);
 +		return true;
 +	}
- 	/*
- 	 * vayugpismmu=1: S2CR bypass (no context bank), =2: S2CR fault (the GPI
- 	 * may not reach memory at all). Tells whether the reset at the first
-@@ -507,7 +559,15 @@ vt_smmu_identity(uint32_t sid)
- 	 * context bank sweet_usb.c set up for USB stream 0x140 (CB4), which
- 	 * demonstrably reaches DDR. 0 = own CB from 8 up (resets), 1 bypass, 2 fault.
- 	 */
--	int mode = 3;
-+	/*
-+	 * 0163: sharing USB's identity CB4 also reset at EV ALLOCATE. Every
-+	 * mode where the GPI reaches memory resets there, so the GPI likely
-+	 * touches some address besides our rings. Mode 4 (default) is what
-+	 * Linux does (qcom,smmu-cfg = 1): a real stage-1 context. Only the 2M
-+	 * blocks holding our buffer are mapped (IOVA = PA); anything else is a
-+	 * context fault (terminate, no stall, no IRQ) that we read back.
-+	 */
-+	int mode = 4;
- 	(void)PE_parse_boot_argn("vayugpismmu", &mode, sizeof(mode));
- 	printf("VAYU TOUCH: SMMU before: sGFSR %#x sCR0 %#x mode %d\n", vt_rd(s, 0x48), vt_rd(s, 0x0), mode);
- 	if (mode == 3) {
-@@ -776,8 +836,8 @@ vg_init(void)
+ 	if (mode == 1 || mode == 2) {
+ 		vt_wr(s, 0xc00 + 4 * slot, mode == 1 ? 0x10000u : 0x20000u);
+ 		vt_wr(s, 0x800 + 4 * slot, (1u << 31) | sid);
+@@ -776,8 +837,8 @@ vg_init(void)
  	sweet_log_flush_now();
  	vt_wr(vg.gpi, GPI_EV_DB, (uint32_t)(vg.pa + VD_EVR + 16u * vg.ev_wp));
  	delay(100);
@@ -108,7 +116,7 @@ index 51f7fbf..d54b3de 100644
  	sweet_log_flush_now();
  	/* channels: 0 = TX (OUT), 1 = RX (IN), paired, protocol SPI (1), SE 0 */
  	for (unsigned k = 0; k < 2; k++) {
-@@ -821,6 +881,10 @@ vg_dump(void)
+@@ -821,6 +882,10 @@ vg_dump(void)
  	    vt_rd(vt.se, 0x040), vt_rd(vt.se, 0x600), vt_rd(vt.se, 0x610), vt_rd(vt.se, 0x614),
  	    vt_rd(vt.se, 0x640), vt_rd(vt.se, 0x644), vt_rd(vt.se, 0xc40), vt_rd(vt.se, 0xd40),
  	    vt_rd(vt.se, SE_DMA_MODE), vt_rd(vt.se, SE_GSI_EVENT_EN));

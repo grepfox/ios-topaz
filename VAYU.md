@@ -2,9 +2,11 @@
 
 Port of this repository (topaz, itself a port of sweet) to the Xiaomi **Poco X3 Pro** (`vayu`, Qualcomm **SM8150-AC** / Snapdragon 860, 6 GB). Branch `vayu`.
 
-**Status (2026-10-21): iOS 16.7.16 boots to the lock screen** on all eight cores with 5 GiB of RAM, power and volume keys, and a live kernel log over USB (`sweetusb=2`, `tools/sweet-usbnet.sh`). Not yet: touch (Novatek NT36672C), wallpaper (as on topaz), battery, Wi-Fi, audio. The first boot of a new root waits several minutes on the Apple logo while LaunchServices builds its database.
+**Status (2026-10-21): iOS 16.7.16 boots to the lock screen** on all eight cores with 5 GiB of RAM, power and volume keys, **touch** (Novatek NT36672C over GPI DMA, since 0168) and a live kernel log over USB (`sweetusb=2`, `tools/sweet-usbnet.sh`). Not yet: wallpaper (as on topaz), battery, Wi-Fi, audio. The first boot of a new root waits several minutes on the Apple logo while LaunchServices builds its database.
 
 What it took on vayu (kernel patches 0140-0150): the SM8150 platform switch (0140), CPU copy display (0141), USB device mode with an identity SMMU context for stream 0x140 (0142-0144; USB DMA faults had stalled UFS), the shim giving xnu the largest DTB /memory block (ABL: 0x80000000+0x3cc00000, 0xc0000000..0x200000000; was 192 MiB), SCTLR_EL1.SPAN on ARMv8.1+ cores (0149), and diagnostics (sampler kernel backtraces, running-thread xcall sampler, fast-fault loop detector).
+
+Touch (0151-0169, `bsd/dev/vayu_touch.c`): SE17's firmware disables the FIFO interface, so SPI goes through the GPI DMA engine at `0xc00000` (GPII1). It needs an RPMh BCM `QUP0` vote, its own stage-1 SMMU context (TCR2 SEP_UPSTREAM) that maps only the DMA buffer for streams `0x7b6` (GPI) and `0x7a3` (QUP SE): the hypervisor turns S2CR bypass into fault, and an identity mapping lets a stray GPI write reset the phone. GPI interrupts are wired (INTSET 1). The chip (trim id `0c 00 00 72 66 03`) uses Novatek's NT36675 map: event buffer `0x22D00`, hw CRC with 3-byte lengths. Firmware `j20s_novatek_ts_fw0{1,2}.bin` (by panel 36/42 from the ABL cmdline) goes into the ADT (`tools/mkadt.py --touch-fw`), never into git.
 
 ## Why vayu is closer to sweet than to topaz
 
@@ -73,7 +75,5 @@ Without a payload argument, `build.sh` makes the **diagnostic shim**: red screen
 
 ## Next
 
-- Novatek NT36672C SPI touch driver (GENI SPI on SE17, firmware download for the flashless IC).
-- USB gadget with the SNPS femto PHY, for the live log over USB (`sweetusb=2`).
 - Battery (PM8150B FG gen4 over SPMI), brightness (DCS 0x51 on DSI0).
 - Wi-Fi: the topaz modem/WLAN path with SM8150 MSS/WCN3998 addresses.

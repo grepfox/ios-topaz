@@ -73,6 +73,8 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - **0167:** stream 0x7a3 (qupv3_2 geni_se cb, Linux s1-bypass) also mapped to the stage-1 CB8 (`vayuqupsid=0` skips); SE dump after a failure (clk_sel, m_clk, word, packing, TX/RX trans len, cpha/cpol, FIFO status). CI 39760913613 ok; image vayu-0167-touch.img (vayutouchgpi=1) https://gofile.io/d/wjEqRYAJ, awaiting log.
 - **0167 result (paste qVLPemx3gu): SPI over GPI WORKS.** Lock screen. With stream 0x7a3 also on CB8 the TX DMA completes: chip id `0c 00 00 72 66 03` (err 0), both firmwares written in ~180 ms (139264 B, 15 partitions, ILM 0+0x12fcf, DLM 0x27140+0x41ef), but no fw run: BLD CRC flag 0x5. Cause: YAAP `nt36xxx_mem_map.h` trim table maps `0c ff ff 72 66 03` to the **NT36675 map** (EVENT_BUF 0x22D00, hw_crc 2 -> 3-byte ILM/DLM length writes, DMA_CRC_EN 0x3F136); we used NT36672A (0x21C00, hw_crc 1, 2-byte length) so ILM length 0x12fcf was written as 0x2fcf.
 - **0168:** chip id byte0 0x0c -> NT36675 map: event buf 0x22D00, CRC length writes 4 bytes ((size>>16)&1). Logs the chosen map. CI 39768746268 ok; image vayu-0168-touch.img (vayutouchgpi=1) https://gofile.io/d/qw9J0F8i, awaiting log.
+- **0168 result: TOUCH WORKS** (user report 2026-10-22, lock screen swipe works; log not pulled). Working chain: SE17 GSI mode, BCM QUP0 vote, own stage-1 SMMU CB (8+) with TCR2 SEP_UPSTREAM mapping only the DMA buffer for streams 0x7b6 (GPI) and 0x7a3 (QUP SE), GPII1 interrupts with INTSET=1, NT36675 map (event buf 0x22D00, hw_crc 2).
+- **0169:** GPI touch on by default (`vayutouchgpi=0` disables). Pending CI + image.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

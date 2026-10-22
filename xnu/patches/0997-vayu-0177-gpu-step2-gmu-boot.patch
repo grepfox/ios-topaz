@@ -1,4 +1,4 @@
-From 4e83f535e53d193c2916446536e0353ecdf7bcf3 Mon Sep 17 00:00:00 2001
+From ad4f382f461e5466bb1f03fffb93e6a5073b390b Mon Sep 17 00:00:00 2001
 From: grep <noreply@anthropic.com>
 Date: Thu, 22 Oct 2026 16:42:26 +0200
 Subject: [PATCH] vayu-0177: Adreno 640 step 2 (vayugpu=2): GMU boot - GPU SMMU
@@ -6,14 +6,14 @@ Subject: [PATCH] vayu-0177: Adreno 640 step 2 (vayugpu=2): GMU boot - GPU SMMU
  cache RAM, HFI queue table, CM3 out of reset (0xBABEFACE), HFI init
 
 ---
- bsd/dev/vayu_gpu.c | 381 +++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 381 insertions(+)
+ bsd/dev/vayu_gpu.c | 382 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 382 insertions(+)
 
 diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
-index 5588aa5..01b44f9 100644
+index 5588aa5..23d7be2 100644
 --- a/bsd/dev/vayu_gpu.c
 +++ b/bsd/dev/vayu_gpu.c
-@@ -19,6 +19,10 @@
+@@ -19,8 +19,13 @@
  #include <mach/mach_time.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -23,8 +23,11 @@ index 5588aa5..01b44f9 100644
 +#include <arm/caches_internal.h>
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  extern void sweet_log_flush_now(void);
-@@ -52,6 +56,8 @@ void vayu_gpu_init(void);
+ void vayu_gpu_init(void);
+ 
+@@ -52,6 +57,8 @@ void vayu_gpu_init(void);
  #define GMU_REG(w)          ((uint32_t)(w) * 4u)
  
  static vm_offset_t vg_gcc, vg_gpu;
@@ -33,7 +36,7 @@ index 5588aa5..01b44f9 100644
  
  static uint32_t
  rd(vm_offset_t b, uint32_t off)
-@@ -165,6 +171,11 @@ vg_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -165,6 +172,11 @@ vg_thread(__unused void *arg, __unused wait_result_t wr_)
  	    rd(vg_gpu, GMU_REG(0x1F8D0)), rd(vg_gpu, GMU_REG(0x23B05)));
  	printf("VAYU GPU: step 1 done\n");
  	sweet_log_flush_now();
@@ -45,7 +48,7 @@ index 5588aa5..01b44f9 100644
  }
  
  void
-@@ -175,9 +186,379 @@ vayu_gpu_init(void)
+@@ -175,9 +187,379 @@ vayu_gpu_init(void)
  	if (!on) {
  		return;
  	}

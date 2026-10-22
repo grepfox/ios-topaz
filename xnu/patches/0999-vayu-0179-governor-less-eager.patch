@@ -1,0 +1,55 @@
+From e1f09be7262e44fcdadb1c7fdbf866f928465f3d Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 20:11:20 +0200
+Subject: [PATCH] vayu-0179: CPU governor screen-on floor 70% fmax, x1.67
+ headroom, >=50% load = fmax, 500 ms before going down, 1 s touch boost;
+ sweetgov=2 = fmax while the display is on
+
+---
+ osfmk/kern/exception.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 659fbaa..1cdcbfb 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1269,7 +1269,7 @@ void
+ sweet_gov_touch(void)
+ {
+ 	uint64_t t;
+-	nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &t);
++	nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &t);
+ 	__atomic_store_n(&gov_boost_until, mach_absolute_time() + t, __ATOMIC_RELAXED);
+ }
+ 
+@@ -1345,13 +1345,23 @@ sweet_gov_thread(__unused void *arg, __unused wait_result_t wr)
+ 			uint32_t top = gov_dom[d].nrow - 1, row = top;
+ 			if (off && !boost) {
+ 				row = 0;
+-			} else if (!boost) {
+-				uint64_t want = ((uint64_t)gov_dom[d].khz[top] * load[d]) / 800u;   /* x1.25 */
++			} else if (!boost && gov_on == 1 && load[d] < 500) {
++				/*
++				 * 0998 boot: x1.25 headroom and 60 ms down left the UI (CPU
++				 * rendered, bursty) at 300/710/825 MHz: very laggy. Screen on:
++				 * floor at 70% of fmax, x1.67 headroom, >= 50% load = fmax.
++				 */
++				uint64_t want = ((uint64_t)gov_dom[d].khz[top] * load[d]) / 600u;
++				uint64_t floor = ((uint64_t)gov_dom[d].khz[top] * 7u) / 10u;
++				if (want < floor) {
++					want = floor;
++				}
+ 				for (row = 0; row < top && gov_dom[d].khz[row] < want; row++) {
+ 				}
+ 			}
+-			if (row < gov_dom[d].cur && ++gov_dom[d].quiet < 3) {
+-				continue;                    /* go down only after 3 quiet samples */
++			/* sweetgov=2: fmax whenever the display is on */
++			if (row < gov_dom[d].cur && ++gov_dom[d].quiet < 25) {
++				continue;                    /* go down only after 500 ms quiet */
+ 			}
+ 			gov_dom[d].quiet = 0;
+ 			if (row != gov_dom[d].cur) {
+-- 
+2.53.0
+

@@ -1,0 +1,67 @@
+From 745b77c73eeea83ae889dfb7abb28e38e08ec387 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 08:36:19 +0200
+Subject: [PATCH] vayu-0160: touch GPI SMMU mode boot-arg (vayugpismmu=1
+ bypass, 2 fault) and SMMU fault dump before each command
+
+---
+ bsd/dev/vayu_touch.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 48d9278..7bd7388 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -448,6 +448,8 @@ vt_spi(const uint8_t *tx, uint8_t *rx, unsigned len)
+  * the highest free ones and the phone reset (no panic): the hypervisor
+  * keeps high banks for itself.
+  */
++static vm_offset_t vg_smmu, vg_cbp;
++
+ static bool
+ vt_smmu_identity(uint32_t sid)
+ {
+@@ -493,6 +495,29 @@ vt_smmu_identity(uint32_t sid)
+ 		return false;
+ 	}
+ 	vm_offset_t gr1 = s + psize, cbp = s + (vm_offset_t)npage * psize + (vm_offset_t)cb * psize;
++	/*
++	 * vayugpismmu=1: S2CR bypass (no context bank), =2: S2CR fault (the GPI
++	 * may not reach memory at all). Tells whether the reset at the first
++	 * GPI command comes from its memory accesses.
++	 */
++	int mode = 0;
++	(void)PE_parse_boot_argn("vayugpismmu", &mode, sizeof(mode));
++	printf("VAYU TOUCH: SMMU before: sGFSR %#x sCR0 %#x mode %d\n", vt_rd(s, 0x48), vt_rd(s, 0x0), mode);
++	if (mode == 1 || mode == 2) {
++		vt_wr(s, 0xc00 + 4 * slot, mode == 1 ? 0x10000u : 0x20000u);
++		vt_wr(s, 0x800 + 4 * slot, (1u << 31) | sid);
++		vt_wr(s, 0x70, 0);
++		for (unsigned n = 0; n < 100000 && (vt_rd(s, 0x74) & 1) != 0; n++) {
++			delay(1);
++		}
++		vg_smmu = s;
++		vg_cbp = 0;
++		printf("VAYU TOUCH: SMMU %s for stream %#x: SMR%u %08x S2CR %08x\n", mode == 1 ? "bypass" : "fault",
++		    sid, slot, vt_rd(s, 0x800 + 4 * slot), vt_rd(s, 0xc00 + 4 * slot));
++		return true;
++	}
++	vg_smmu = s;
++	vg_cbp = cbp;
+ 	vt_wr(cbp, 0x58, 0xffffffff);
+ 	vt_wr(cbp, 0x20, 0);
+ 	vt_wr(cbp, 0x24, 0);
+@@ -525,6 +550,10 @@ static bool
+ vg_cmd(unsigned k, uint32_t op, unsigned want)
+ {
+ 	uint32_t ctx = k < 2 ? GPI_CH_CTX(k) : GPI_EV_CTX;
++	if (vg_smmu) {
++		printf("VAYU TOUCH: SMMU now: sGFSR %#x sGFSYNR0 %#x CB FSR %#x\n", vt_rd(vg_smmu, 0x48),
++		    vt_rd(vg_smmu, 0x50), vg_cbp ? vt_rd(vg_cbp, 0x58) : 0u);
++	}
+ 	printf("VAYU TOUCH: GPI cmd %u to %s%u: writing %#x (glob %#x gpii %#x err %#x)\n", op,
+ 	    k < 2 ? "ch" : "ev", k < 2 ? k : 0u, k < 2 ? GPI_CH_CMD : GPI_EV_CMD,
+ 	    vt_rd(vg.gpi, 0x23100u + 0x4000u * VT_GPII), vt_rd(vg.gpi, 0x23118u + 0x4000u * VT_GPII),
+-- 
+2.53.0
+

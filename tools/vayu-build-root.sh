@@ -9,8 +9,13 @@
 #
 # IPSW_DIR holds the three disk images of the D22AP Erase identity
 # (BuildManifest.plist): OS 087-86698-044.dmg, SystemOS 087-86593-047.dmg,
-# AppOS 087-86715-047.dmg. Output: IPSW_DIR/ios16-root.img (16 GiB raw) and
+# AppOS 087-86715-047.dmg. Output: IPSW_DIR/ios16-root.img (sparse raw) and
 # IPSW_DIR/ios16-root.simg (for `fastboot flash userdata`).
+#
+# ROOT_SIZE (default 16G) is the HFS+ volume size, which is what iOS reports
+# as capacity. The whole vayu userdata is 0x1AC55 MiB (109653 MiB); the kernel
+# log ring uses its last 4 MiB + 4 KiB (sweet_ufs.c), so the largest safe
+# value is ROOT_SIZE=109637M (16 MiB short of the end).
 # apfs-fuse may live in ~/src/apfs-fuse/build (not packaged by Ubuntu).
 set -euo pipefail
 dir=$(realpath "${1:?usage: vayu-build-root.sh IPSW_DIR}")
@@ -32,7 +37,7 @@ if [[ ${2:-} == --reuse && -e $img ]]; then
 else
 	[[ ! -e $img ]] || { echo "$img exists; remove it to rebuild, or pass --reuse" >&2; exit 1; }
 	bash "$repo/tools/mkiosroot.sh" "$dir/087-86698-044.dmg" "$dir/087-86593-047.dmg" \
-		"$dir/087-86715-047.dmg" "$img" 16G
+		"$dir/087-86715-047.dmg" "$img" "${ROOT_SIZE:-16G}"
 fi
 
 mnt=$(mktemp -d)

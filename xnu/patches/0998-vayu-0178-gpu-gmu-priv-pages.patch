@@ -1,0 +1,84 @@
+From 4e6bc44ec502d08c54889a0b37d1ba84d850029d Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 19:26:57 +0200
+Subject: [PATCH] vayu-0178: GPU step 2: GMU code/data/log pages
+ privileged-only (AP 0b00); the GMU's privileged fetch at 0x4dc0 took a
+ permission fault
+
+---
+ bsd/dev/vayu_gpu.c | 32 ++++++++++++++++++++------------
+ 1 file changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 23d7be2..4a8252b 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -229,8 +229,14 @@ vayu_gpu_init(void)
+ static vm_offset_t vg_mem, vg_cbp;
+ static uint64_t vg_mem_pa;
+ 
++/*
++ * priv: AP = 0b00 (EL1 RW only), as KGSL's IOMMU_PRIV mappings. 0997 boot:
++ * with AP = 0b01 (RW at EL0 too) the GMU's privileged instruction fetch at
++ * 0x4dc0 (ICACHE) took a permission fault: stage 1 makes EL0-writable pages
++ * privileged execute-never.
++ */
+ static void
+-vg_map4k(uint32_t va, uint32_t off)
++vg_map4k(uint32_t va, uint32_t off, bool priv)
+ {
+ 	volatile uint64_t *l3;
+ 	if (va < 0x200000u) {
+@@ -240,15 +246,15 @@ vg_map4k(uint32_t va, uint32_t off)
+ 	} else {
+ 		l3 = (volatile uint64_t *)(vg_mem + M_L3C);
+ 	}
+-	/* page, AttrIndx 0 (normal non-cacheable), AP RW any, inner shareable, AF */
+-	l3[(va >> 12) & 511] = (vg_mem_pa + off) | (1u << 10) | (3u << 8) | (1u << 6) | 3u;
++	/* page, AttrIndx 0 (normal non-cacheable), inner shareable, AF; AP by priv */
++	l3[(va >> 12) & 511] = (vg_mem_pa + off) | (1u << 10) | (3u << 8) | (priv ? 0u : (1u << 6)) | 3u;
+ }
+ 
+ static void
+-vg_mapr(uint32_t va, uint32_t off, uint32_t size)
++vg_mapr(uint32_t va, uint32_t off, uint32_t size, bool priv)
+ {
+ 	for (uint32_t i = 0; i < size; i += 0x1000) {
+-		vg_map4k(va + i, off + i);
++		vg_map4k(va + i, off + i, priv);
+ 	}
+ }
+ 
+@@ -300,11 +306,12 @@ vg_smmu_gmu(void)
+ 	l2a[0] = (vg_mem_pa + M_L3A) | 3u;
+ 	l2b[(0x60000000u >> 21) & 511] = (vg_mem_pa + M_L3B) | 3u;
+ 	l2b[(0x60200000u >> 21) & 511] = (vg_mem_pa + M_L3C) | 3u;
+-	vg_mapr(0x4000u, M_ICACHE, 0x3c000u);
+-	vg_mapr(0x44000u, M_DCACHE, 0x3c000u);
+-	vg_mapr(0x60000000u, M_PERSIST, 0x1000u);
+-	vg_mapr(GMU_HFI_VA, M_HFI, 0x5000u);
+-	vg_mapr(GMU_LOG_VA, M_LOG, 0x1000u);
++	/* kgsl_gmu.c: icache, dcache, dummy page and log IOMMU_PRIV; HFI not */
++	vg_mapr(0x4000u, M_ICACHE, 0x3c000u, true);
++	vg_mapr(0x44000u, M_DCACHE, 0x3c000u, true);
++	vg_mapr(0x60000000u, M_PERSIST, 0x1000u, true);
++	vg_mapr(GMU_HFI_VA, M_HFI, 0x5000u, false);
++	vg_mapr(GMU_LOG_VA, M_LOG, 0x1000u, true);
+ 	flush_dcache64((addr64_t)vg_mem_pa, M_SIZE, TRUE);
+ 	wr(cbp, 0x0, 0);
+ 	wr(cbp, 0x58, 0xffffffffu);
+@@ -545,8 +552,9 @@ vg_step2(void)
+ 		}
+ 		delay(100);
+ 	}
+-	printf("VAYU GPU: step 2d: FW_INIT_RESULT %#x (%s), SMMU FSR %#x FAR %#x\n", res,
+-	    res == 0xBABEFACEu ? "GMU booted" : "no boot", rd(vg_cbp, 0x58), rd(vg_cbp, 0x60));
++	printf("VAYU GPU: step 2d: FW_INIT_RESULT %#x (%s), SMMU FSR %#x FAR %#x FSYNR0 %#x, GMU general0 %#x\n", res,
++	    res == 0xBABEFACEu ? "GMU booted" : "no boot", rd(vg_cbp, 0x58), rd(vg_cbp, 0x60), rd(vg_cbp, 0x68),
++	    gmu_rd(0x1F9C5));
+ 	sweet_log_flush_now();
+ 	if (res != 0xBABEFACEu) {
+ 		gmu_wr(0x1F800, 1);             /* back into reset */
+-- 
+2.53.0
+

@@ -1,0 +1,107 @@
+From aaf533d9b5ef710af121518680396c49df2cd230 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:34:14 +0200
+Subject: [PATCH] vayu-0182: GPU step 4 buffer 256 KB page aligned, mapped page
+ by page (2 MB physically aligned alloc hung the phone)
+
+---
+ bsd/dev/vayu_gpu.c | 42 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 31 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 0702228..00afca8 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -860,8 +860,14 @@ vg_step3(void)
+ #define SCM_FN(svc, cmd) (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ #define M_GL1           0xA0000u        /* GPU stream tables in the GMU RAM buffer */
+ #define M_GL2           0xA1000u
+-/* GPU buffer (2 MB, 2 MB aligned, mapped IOVA = PA): SQE, ring, scratch */
+-#define G_SIZE          0x200000u
++#define M_GL3A          0xA2000u        /* the 2 MB window(s) holding the GPU buffer */
++#define M_GL3B          0xA3000u
++/*
++ * GPU buffer (256 KB, page aligned, mapped page by page with IOVA = PA):
++ * SQE, ring, scratch. 1001 boot: a 2 MB physically aligned kmem_alloc_contig
++ * never returned and hung the phone.
++ */
++#define G_SIZE          0x40000u
+ #define G_SQE           0x00000u
+ #define G_RING          0x10000u
+ #define G_MEM           0x20000u
+@@ -976,7 +982,7 @@ vg_zap(void)
+ 	return st == 0 && res == 0;
+ }
+ 
+-/* GPU stream (SID 0, mask 0x401, DT gfx3d_user) on its own CB: one 2 MB block, IOVA = PA */
++/* GPU stream (SID 0, mask 0x401, DT gfx3d_user) on its own CB: 4K pages, IOVA = PA */
+ static bool
+ vg_smmu_gpu(void)
+ {
+@@ -1007,13 +1013,26 @@ vg_smmu_gpu(void)
+ 	}
+ 	vm_offset_t gr1 = s + psize, cbp = s + (vm_offset_t)npage * psize + (vm_offset_t)cb * psize;
+ 	volatile uint64_t *l1 = (volatile uint64_t *)(vg_mem + M_GL1), *l2 = (volatile uint64_t *)(vg_mem + M_GL2);
++	volatile uint64_t *l3a = (volatile uint64_t *)(vg_mem + M_GL3A), *l3b = (volatile uint64_t *)(vg_mem + M_GL3B);
+ 	for (unsigned i = 0; i < 512; i++) {
+ 		l1[i] = 0;
+ 		l2[i] = 0;
++		l3a[i] = 0;
++		l3b[i] = 0;
++	}
++	uint64_t first = vg_g_pa & ~0x1fffffull, last = (vg_g_pa + G_SIZE - 1) & ~0x1fffffull;
++	if ((first >> 30) != (last >> 30)) {
++		printf("VAYU GPU: GPU buffer crosses 1 GB\n");
++		return false;
+ 	}
+-	l1[(vg_g_pa >> 30) & 511] = (vg_mem_pa + M_GL2) | 3u;
+-	l2[(vg_g_pa >> 21) & 511] = vg_g_pa | (1u << 10) | (3u << 8) | (1u << 6) | 1u;   /* block, AP RW any */
+-	flush_dcache64((addr64_t)(vg_mem_pa + M_GL1), 0x2000, TRUE);
++	l1[(first >> 30) & 511] = (vg_mem_pa + M_GL2) | 3u;
++	l2[(first >> 21) & 511] = (vg_mem_pa + M_GL3A) | 3u;
++	l2[(last >> 21) & 511] = (vg_mem_pa + (last == first ? M_GL3A : M_GL3B)) | 3u;
++	for (uint64_t pa = vg_g_pa; pa < vg_g_pa + G_SIZE; pa += 0x1000) {
++		volatile uint64_t *l3 = (pa & ~0x1fffffull) == first ? l3a : l3b;
++		l3[(pa >> 12) & 511] = pa | (1u << 10) | (3u << 8) | (1u << 6) | 3u;    /* page, AP RW any */
++	}
++	flush_dcache64((addr64_t)(vg_mem_pa + M_GL1), 0x4000, TRUE);
+ 	wr(cbp, 0x0, 0);
+ 	wr(cbp, 0x58, 0xffffffffu);
+ 	wr(gr1, 0x800 + 4 * cb, 1u);
+@@ -1039,7 +1058,7 @@ vg_smmu_gpu(void)
+ 		delay(1);
+ 	}
+ 	vg_cbg = cbp;
+-	printf("VAYU GPU: GPU SMMU GPU stream 0/0x401 -> CB%u SMR%u: SMR %08x S2CR %08x, block %#llx\n",
++	printf("VAYU GPU: GPU SMMU GPU stream 0/0x401 -> CB%u SMR%u: SMR %08x S2CR %08x, pages at %#llx\n",
+ 	    cb, slot, rd(s, 0x800 + 4 * slot), rd(s, 0xc00 + 4 * slot), vg_g_pa);
+ 	return true;
+ }
+@@ -1147,19 +1166,20 @@ vg_step4(void)
+ {
+ 	printf("VAYU GPU: step 4 start (zap, GPU SMMU, CP)\n");
+ 	sweet_log_flush_now();
+-	/* pnum_mask: physical 2 MB alignment (the GPU stream maps one 2 MB block) */
+-	if (kmem_alloc_contig(kernel_map, &vg_g, G_SIZE, PAGE_MASK, 0, (ppnum_t)(G_SIZE / PAGE_SIZE - 1),
++	printf("VAYU GPU: step 4a: allocating the GPU buffer\n");
++	sweet_log_flush_now();
++	if (kmem_alloc_contig(kernel_map, &vg_g, G_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("VAYU GPU: no 2 MB GPU buffer\n");
+ 		return false;
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)vg_g);
+ 	vg_g_pa = pn ? ptoa_64(pn) : 0;
+-	if (!vg_g_pa || (vg_g_pa & (G_SIZE - 1))) {
+-		printf("VAYU GPU: GPU buffer %#llx not 2 MB aligned\n", vg_g_pa);
++	if (!vg_g_pa) {
+ 		return false;
+ 	}
+ 	printf("VAYU GPU: step 4a: GPU buffer %#llx\n", vg_g_pa);
++	sweet_log_flush_now();
+ 	bool zap = vg_zap();
+ 	printf("VAYU GPU: step 4b: zap shader %s\n", zap ? "loaded" : "NOT loaded (trust register fallback)");
+ 	sweet_log_flush_now();
+-- 
+2.53.0
+

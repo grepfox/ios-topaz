@@ -103,7 +103,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, target='topaz', touch_fw=None):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, target='topaz', touch_fw=None, gpu_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     vayu = target == 'vayu'
     phys_base, mem_size = ((VAYU['PHYS_BASE'], VAYU['MEM_SIZE']) if vayu and not qemu else
@@ -313,7 +313,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, targ
        # vayu touch (bsd/dev/vayu_touch.c): the flashless Novatek NT36672C
        # firmware, Tianma (fw01) and CSOT (fw02) panels. Xiaomi/Novatek
        # binaries: read from a local kernel build, never committed.
-       ([node('vayu-touch', [ph()] + [(k, v) for k, v in sorted(touch_fw.items())])] if touch_fw else []))
+       ([node('vayu-touch', [ph()] + [(k, v) for k, v in sorted(touch_fw.items())])] if touch_fw else []) +
+       # vayu GPU (bsd/dev/vayu_gpu.c): Adreno 640 SQE, GMU firmware and the
+       # zap shader (mdt + segments, authenticated by TZ). Qualcomm binaries
+       # from the vendor tree, never committed.
+       ([node('vayu-gpu', [ph()] + [(k, v) for k, v in sorted(gpu_fw.items())])] if gpu_fw else []))
 
 
 if __name__ == '__main__':
@@ -333,9 +337,22 @@ if __name__ == '__main__':
                 print(f'{p}: {len(touch_fw[key])} bytes -> /vayu-touch {key}', file=sys.stderr)
         if not touch_fw:
             raise SystemExit(f'--touch-fw {d}: no j20s_novatek_ts_fw01.bin / fw02.bin')
+    gpu_fw = None
+    if '--gpu-fw' in sys.argv:
+        # DIR = vendor/firmware of the stock vayu ROM (a630_sqe.fw is the SQE
+        # KGSL loads for the A640, adreno-gpulist.h)
+        d = sys.argv[sys.argv.index('--gpu-fw') + 1]
+        gpu_fw = {}
+        for key, name in (('sqe', 'a630_sqe.fw'), ('gmu', 'a640_gmu.bin'), ('zap-mdt', 'a640_zap.mdt'),
+                          ('zap-b00', 'a640_zap.b00'), ('zap-b01', 'a640_zap.b01'), ('zap-b02', 'a640_zap.b02')):
+            p = os.path.join(d, name)
+            if not os.path.exists(p):
+                raise SystemExit(f'--gpu-fw {d}: missing {name}')
+            gpu_fw[key] = open(p, 'rb').read()
+            print(f'{p}: {len(gpu_fw[key])} bytes -> /vayu-gpu {key}', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  native='--native' in sys.argv, midmem='--midmem' in sys.argv, target=target,
-                 touch_fw=touch_fw)
+                 touch_fw=touch_fw, gpu_fw=gpu_fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

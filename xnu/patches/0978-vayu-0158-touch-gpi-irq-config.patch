@@ -1,0 +1,55 @@
+From 51955ee9e14bb377f19d2c9de091f2dd26485e8c Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 22:12:34 +0200
+Subject: [PATCH] vayu-0158: touch GPI: interrupt config before the first
+ command, as Linux
+
+0157 also reset on the first command write (GPII1 clean; the other
+GPIIs' error log values are noise). Linux programs the GPII interrupt
+registers (gpi_config_interrupts) before any command; do the same and
+mark the first plain GPI write, to tell a write-protected GPI from a
+command-specific reset.
+---
+ bsd/dev/vayu_touch.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 2db6138..1f80f0a 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -640,6 +640,32 @@ vg_init(void)
+ 		(void)vg_cmd(2, GPI_CMD_RESET, 1);
+ 		(void)vg_cmd(2, GPI_CMD_DEALLOC, 0);
+ 	}
++	/*
++	 * gpi_config_interrupts (DEFAULT_IRQ_SETTINGS), done by Linux before the
++	 * first command. 0157 wrote the command first and reset the phone; the
++	 * first marker below shows whether any GPI write is fatal.
++	 */
++	{
++		uint32_t b = 0x4000u * VT_GPII;
++		printf("VAYU TOUCH: GPI step 3b: irq config, first write (type irq %#x msk %#x)\n",
++		    vt_rd(vg.gpi, 0x23080u + b), vt_rd(vg.gpi, 0x23088u + b));
++		sweet_log_flush_now();
++		vt_wr(vg.gpi, 0x23088u + b, 0x4fu);     /* TYPE_IRQ_MSK: GENERAL|IEOB|GLOB|EV_CTRL|CH_CTRL */
++		printf("VAYU TOUCH: GPI step 3c: first GPI write OK (msk now %#x)\n", vt_rd(vg.gpi, 0x23088u + b));
++		sweet_log_flush_now();
++		vt_wr(vg.gpi, 0x230B8u + b, 1);         /* SRC_IEOB_IRQ_MSK */
++		vt_wr(vg.gpi, 0x23098u + b, 3);         /* SRC_CH_IRQ_MSK */
++		vt_wr(vg.gpi, 0x2309Cu + b, 1);         /* SRC_EV_CH_IRQ_MSK */
++		vt_wr(vg.gpi, 0x23108u + b, 1);         /* GLOB_IRQ_EN: ERROR_INT */
++		vt_wr(vg.gpi, 0x23120u + b, 0xfu);      /* GPII_IRQ_EN */
++		vt_wr(vg.gpi, 0x23188u + b, 0);         /* MSI base */
++		vt_wr(vg.gpi, 0x2318Cu + b, 0);
++		vt_wr(vg.gpi, 0x23400u + b, 0);         /* SCRATCH_0/1 */
++		vt_wr(vg.gpi, 0x23404u + b, 0);
++		vt_wr(vg.gpi, 0x23180u + b, 0);         /* INTSET (0, as gpi_config_interrupts) */
++		printf("VAYU TOUCH: GPI step 3d: irq config done\n");
++		sweet_log_flush_now();
++	}
+ 	/* event ring (gpi_alloc_ev_chan): allocate, program, hand all slots but one to the GPI */
+ 	printf("VAYU TOUCH: GPI step 4: event ring\n");
+ 	sweet_log_flush_now();
+-- 
+2.53.0
+

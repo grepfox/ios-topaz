@@ -1,0 +1,128 @@
+From b0bac99f22d1e3301b264f14adf6971cdb7e3f54 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 13:42:11 +0200
+Subject: [PATCH] vayu-0170: measured CPU clocks per core and voted cpufreq
+ rows (SWEET SPEED, 40 s and 180 s; sweetspeed=0 off)
+
+---
+ bsd/dev/vayu_touch.c   |  2 +
+ osfmk/kern/exception.c | 83 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 75f61ae..74ab9ff 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -43,6 +43,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern void sweet_log_flush_now(void);   /* bsd/dev/sweet_ufs.c */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void vayu_touch_init(void);
++extern void sweet_speed_start(void);
+ 
+ /* GCC (gcc-sm8150.c): QUPv3 wrap2 S0 (= SE17) branch, its RCG, wrap2 AHB votes */
+ #define VT_GCC_PA        0x00100000u
+@@ -1474,6 +1475,7 @@ vayu_touch_init(void)
+ 		return;
+ 	}
+ 	vt.started = true;
++	sweet_speed_start();            /* osfmk/kern/exception.c: measured CPU clocks */
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("vayutouchdiag", &vt.diag, sizeof(vt.diag));
+ 	if (!enabled) {
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index dd167d1..0001d9f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1157,6 +1157,89 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	}
+ }
+ 
++
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/cpu_number.h>
++/*
++ * SWEET vayu: measured CPU clocks. The shim votes each cpufreq-hw domain to
++ * its top LUT row once; nothing checked what the cores actually run at
++ * (limits/throttling) while CoreAnimation renders on the CPU. Each CPU runs
++ * a chain of dependent adds (1 cycle each on A55/A76) against the 19.2 MHz
++ * timer; the domains' voted rows are read back too.
++ */
++static uint64_t
++sweet_speed_spin(uint64_t n)
++{
++	uint64_t x = 0;
++	__asm__ volatile (
++		"1:\n"
++		"add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n"
++		"add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n"
++		"add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n"
++		"add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n"
++		"subs %1, %1, #1\n"
++		"b.ne 1b\n"
++		: "+r"(x), "+r"(n) : : "cc");
++	return x;
++}
++
++static void
++sweet_speed_report(int round)
++{
++	static const uint32_t dom[3] = { 0x18323000u, 0x18325800u, 0x18327800u };
++	static const char *const dname[3] = { "silver", "gold", "prime" };
++	for (unsigned d = 0; d < 3; d++) {
++		vm_offset_t b = ml_io_map(dom[d], 0x1000);
++		if (!b) {
++			continue;
++		}
++		uint32_t st = *(volatile uint32_t *)(b + 0x920);
++		uint32_t v = st < 40 ? *(volatile uint32_t *)(b + 0x110 + 0x20 * st) : 0;
++		uint32_t khz = ((v >> 30) & 3) ? 19200 * (v & 0xff) : 300000;
++		printf("SWEET SPEED[%d]: %s perf state %u lut %#x -> %u MHz, enable %#x\n",
++		    round, dname[d], st, v, khz / 1000, *(volatile uint32_t *)(b + 0x0));
++	}
++	unsigned n = ml_get_cpu_count();
++	for (unsigned c = 0; c < n && c < 8; c++) {
++		processor_t p = cpu_to_processor((int)c);
++		if (p == PROCESSOR_NULL) {
++			continue;
++		}
++		thread_bind(p);
++		thread_block(THREAD_CONTINUE_NULL);
++		(void)sweet_speed_spin(100000);            /* warm up, let DCVS settle */
++		uint64_t it = 2000000, t0 = mach_absolute_time();
++		(void)sweet_speed_spin(it);
++		uint64_t ns, dt = mach_absolute_time() - t0;
++		absolutetime_to_nanoseconds(dt, &ns);
++		printf("SWEET SPEED[%d]: cpu%u (on cpu %d) ~%llu MHz\n", round, c, cpu_number(),
++		    ns ? (16ull * it * 1000ull) / ns : 0ull);
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++sweet_speed_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	delay_for_interval(40, NSEC_PER_SEC);
++	sweet_speed_report(0);
++	delay_for_interval(140, NSEC_PER_SEC);
++	sweet_speed_report(1);
++}
++
++void sweet_speed_start(void);
++void
++sweet_speed_start(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("sweetspeed", &on, sizeof(on));
++	thread_t t;
++	if (on && kernel_thread_start(sweet_speed_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t
+-- 
+2.53.0
+

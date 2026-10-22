@@ -1,0 +1,89 @@
+From 4f96194fe350ff1236ae5a00e1d9f80245d486aa Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 13:43:54 +0200
+Subject: [PATCH] vayu-0145: sampler prints kernel state, wait event and kernel
+ backtrace
+
+0144 sampled launchd blocked in dyld start -> lsl persistentAllocator ->
+vm_allocate (mach_vm_allocate trap). Print, per thread, the scheduler
+state, the wait event and (when not running) the saved kernel frame
+chain, unslid, plus free/wired page counts and the kernel slide.
+---
+ osfmk/kern/exception.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..8b8cd28 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -88,6 +88,7 @@
+ #include <kern/task_ident.h>
+ 
+ #include <vm/vm_map.h>
++#include <machine/machine_routines.h>
+ 
+ #include <security/mac_mach_internal.h>
+ #include <string.h>
+@@ -995,6 +996,7 @@ sweet_crash_strings(const char *name)
+  * pointer backtrace of every thread of a task, from the saved user state.
+  */
+ void sweet_sample_task(const char *name, int pid, task_t task);
++extern unsigned int vm_page_free_count, vm_page_wire_count;
+ 
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1009,7 +1011,8 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+ 	}
+-	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	printf("SMP %s[%d] slide 0x%llx mh 0x%llx free %u wired %u kslide 0x%lx\n", name, pid, slide,
++	    task->mach_header_vm_address, vm_page_free_count, vm_page_wire_count, vm_kernel_slide);
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+@@ -1018,7 +1021,41 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		int n;
+ 		uint64_t fp;
+ 
++		/*
++		 * Kernel side: scheduler state, wait event and, for a thread that is
++		 * not running, the saved kernel frame chain (unslid addresses:
++		 * symbolicate against kernel.development.sweet).
++		 */
++		/* wait events are mostly heap addresses (raw); a slid one is shown unslid as wait_k */
++		n = snprintf(line, sizeof(line), "SMP %s t%d kstate 0x%x wait 0x%llx wait_k 0x%lx", name, tn,
++		    thread->state, (unsigned long long)thread->wait_event,
++		    (unsigned long)VM_KERNEL_UNSLIDE(thread->wait_event));
++		if (!(thread->state & TH_RUN) && thread->kernel_stack != 0 && thread->machine.kstackptr != 0) {
++			arm_kernel_saved_state_t ks;
++			vm_offset_t lo = thread->kernel_stack, hi = lo + kernel_stack_size;
++			if (ml_nofault_copy((vm_offset_t)&((thread_kernel_state_t)thread->machine.kstackptr)->machine.ss,
++			    (vm_offset_t)&ks, sizeof(ks)) != sizeof(ks)) {
++				ks.fp = ks.lr = 0;
++			}
++			n += snprintf(line + n, sizeof(line) - n, " klr 0x%lx kbt",
++			    (unsigned long)VM_KERNEL_UNSLIDE(ks.lr));
++			uint64_t kfp = ks.fp;
++			for (int i = 0; i < 16 && kfp >= lo && kfp + 16 <= hi && (kfp & 7) == 0 && n < (int)sizeof(line) - 24; i++) {
++				uint64_t frame[2];
++				if (ml_nofault_copy((vm_offset_t)kfp, (vm_offset_t)frame, sizeof(frame)) != sizeof(frame)) {
++					break;
++				}
++				n += snprintf(line + n, sizeof(line) - n, " 0x%lx", (unsigned long)VM_KERNEL_UNSLIDE(frame[1]));
++				if (frame[0] <= kfp) {
++					break;
++				}
++				kfp = frame[0];
++			}
++		}
++		printf("%s\n", line);
++
+ 		if (ss == NULL || !is_saved_state64(ss)) {
++			tn++;
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-- 
+2.53.0
+

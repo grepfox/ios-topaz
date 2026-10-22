@@ -4,7 +4,13 @@
 
 This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Apple's open-source XNU kernel, xnu-8796, on a Redmi Note 10 Pro) to the Xiaomi **Redmi Note 12 4G** (`topaz` / `tapas`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cortex-A73 cores, with **touch, volume and power keys**, and **Wi-Fi**: iOS Settings lists networks, joins WPA2 networks, remembers the password in the keychain and reconnects after a reboot; Safari loads pages over HTTPS. The modem and Wi-Fi firmware are booted by our own XNU driver straight from the phone's stock `modem_a` partition. Rendering in this repository runs on the CPU; GPU acceleration (Adreno 610) works on the phone with patches from HackiOS and will be published here once HackiOS publishes its source (see the roadmap).
+
+> **Thanks to HackiOS.** The GPU (Adreno through Mesa), display presentation, audio, Wi-Fi glue,
+> sandbox and tweak-injection work here started from [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)
+> by OOSEX GANG (kernel: APSL 2.0, [user space](https://github.com/oosexgang/hackios-xnu-userland): MIT).
+> What comes from it and under which licence: [CREDITS.md](CREDITS.md).
+
+As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cortex-A73 cores, with **touch, volume and power keys**, and **Wi-Fi**: iOS Settings lists networks, joins WPA2 networks, remembers the password in the keychain and reconnects after a reboot; Safari loads pages over HTTPS. The modem and Wi-Fi firmware are booted by our own XNU driver straight from the phone's stock `modem_a` partition. Since **2026-10-22** the GPU work is here too: the Adreno 610 draws the whole UI through Mesa freedreno behind CoreAnimation's OpenGL ES renderer, with all eight cores (AMP), sound, charging, wallpapers, widgets and tweak injection (ElleKit). Much of it started from **HackiOS** (now open source, see [CREDITS.md](CREDITS.md)).
 
 > **Poco X3 Pro (vayu, SM8150-AC):** the `vayu` branch adds a second target (shim, ADT, kernel patch 0140); not booted yet. See [VAYU.md](VAYU.md).
 
@@ -29,7 +35,7 @@ As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cort
 ## What does not work (yet)
 
 - **No Bluetooth, cellular data, audio, camera, sensors, GPS, SEP.** `bluetoothd` and `fairplayd.H2` relaunch constantly because the hardware is missing.
-- **No GPU in this repository**, so CoreAnimation renders in software and the frame rate is low. Safari shows blank pages (WebKit wants a GPU).
+- **Frame rate**: 25–35 frames a second in animations (the GPU and CoreAnimation's own pacing are the limits now), not yet 60.
 - **Wi-Fi**: WPA2-PSK only (no WPA3, open networks untested), no power save, no MAC randomisation.
 - **Wallpaper and widgets**: LaunchServices registers apps but no app extensions on this root, so PosterBoard finds no wallpaper provider (being investigated).
 - **No real-time clock**: the date starts at 31 December.
@@ -136,7 +142,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 
 1. ~~Touch~~ and ~~buttons~~: done (patches 0083–0090).
 2. ~~Wi-Fi~~: done (patches 0113–0130); next: WPA3, open networks, power save.
-3. **GPU (Adreno 610)**, in progress: a kernel driver after topaz-woa `TopazGpuW` with Mesa freedreno behind CoreAnimation's OpenGL ES renderer. On the phone the lock screen, home screen and Settings already draw on the GPU. That work uses patches from **HackiOS** (a port of iOS 16 to the POCO X5 Pro, whose author shared its code with us privately); they will be added to this repository once HackiOS publishes its source, and until then they are kept out of it. The kernel IOSurface work it needed is here: patches 0131–0139 (`SweetSurface` values, bulk attachments, client-memory surfaces, the release protocol) and 0138 (empty `IOAcceleratorES`, which saves 30 s at every backboardd start). Next: render straight into display surfaces (today the CPU copies every frame out), GPU clock above 600 MHz with the GX voltage vote, then Metal.
+3. **GPU (Adreno 610)**, in progress: a kernel driver after topaz-woa `TopazGpuW` with Mesa freedreno behind CoreAnimation's OpenGL ES renderer. On the phone the lock screen, home screen and Settings already draw on the GPU. That work uses code from **HackiOS** (a port of iOS 16 to the POCO X5 Pro), published 2026-10-22 under APSL 2.0 / MIT: kernel patches 0900–0947, user space in `userland/` (eagl, Mesa patches, RedwoodAudio), see [CREDITS.md](CREDITS.md). Build the kernel on a Mac with `tools/build-local.sh`. The kernel IOSurface work it needed is here: patches 0131–0139 (`SweetSurface` values, bulk attachments, client-memory surfaces, the release protocol) and 0138 (empty `IOAcceleratorES`, which saves 30 s at every backboardd start). Next: render straight into display surfaces (today the CPU copies every frame out), GPU clock above 600 MHz with the GX voltage vote, then Metal.
 4. **Narrow the GIC fix** to the register that actually matters, then move it into XNU.
 5. **Real-time clock** from the PMIC RTC or passed in by the shim.
 6. **All 8 cores (experiment, later):** build XNU with 4K pages (drop `__ARM_16K_PG__` from `SWEET.h`, as XNU's own `BCM2837` Raspberry Pi 3 config does on Cortex-A53) and describe two clusters, Gold as `P` and Silver as `E`, so the AMP scheduler uses both. Risk: the iOS 16 userland was only ever run on 16K pages (hard-coded 16K in malloc, JIT guard pages, IOSurface, commpage layout), and the 16K assumptions in the shim and sweet's patches have to be checked too. The 16K Gold-only kernel stays as the fallback.

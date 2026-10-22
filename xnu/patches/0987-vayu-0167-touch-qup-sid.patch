@@ -1,0 +1,59 @@
+From 329f7fef683cede451cf3e122db4324a2908df57 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 12:08:42 +0200
+Subject: [PATCH] vayu-0167: SMMU stream 0x7a3 (QUPv3 wrap2 SE DMA) on the
+ touch stage-1 bank; SE register dump after a failed transfer
+
+---
+ bsd/dev/vayu_touch.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 74ca6a4..7e7e39b 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -591,6 +591,30 @@ vt_smmu_identity(uint32_t sid)
+ 		vt_wr(cbp, 0x0, 0x21);                  /* SCTLR: M, CFRE (abort), no stall, no IRQ */
+ 		vt_wr(s, 0xc00 + 4 * slot, cb);
+ 		vt_wr(s, 0x800 + 4 * slot, (1u << 31) | sid);
++		/*
++		 * 0166: GO reached the SE (M_CMD0 TX_ONLY active) but the DMA TRE
++		 * completed with UNEXP_ERR. The QUPv3 wrapper's own stream 0x7a3
++		 * (qupv3_2 geni_se cb, s1-bypass in Linux) may do the SE side of the
++		 * data move; put it on this bank too (vayuqupsid=0 skips).
++		 */
++		int qs = 1;
++		(void)PE_parse_boot_argn("vayuqupsid", &qs, sizeof(qs));
++		for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++			uint32_t smr = vt_rd(s, 0x800 + 4 * i);
++			if ((smr >> 31) && ((smr ^ 0x7a3u) & ~((smr >> 16) & 0x7fffu) & 0x7fffu) == 0) {
++				printf("VAYU TOUCH: SMMU SMR%u %08x S2CR %08x already covers stream 0x7a3\n", i, smr, vt_rd(s, 0xc00 + 4 * i));
++				qs = 0;
++			}
++		}
++		for (uint32_t i = slot + 1; qs && i < nsmr && i < 128; i++) {
++			if ((vt_rd(s, 0x800 + 4 * i) >> 31) == 0) {
++				vt_wr(s, 0xc00 + 4 * i, cb);
++				vt_wr(s, 0x800 + 4 * i, (1u << 31) | 0x7a3u);
++				printf("VAYU TOUCH: SMMU stream 0x7a3 -> CB%u via SMR%u: %08x S2CR %08x\n", cb, i,
++				    vt_rd(s, 0x800 + 4 * i), vt_rd(s, 0xc00 + 4 * i));
++				break;
++			}
++		}
+ 		vt_wr(s, 0x70, 0);
+ 		for (unsigned n = 0; n < 100000 && (vt_rd(s, 0x74) & 1) != 0; n++) {
+ 			delay(1);
+@@ -897,6 +921,10 @@ vg_dump(void)
+ 		printf("VAYU TOUCH: SMMU CB FSR %#x FAR %08x%08x FSYNR0 %#x sGFSR %#x\n", vt_rd(vg_cbp, 0x58),
+ 		    vt_rd(vg_cbp, 0x64), vt_rd(vg_cbp, 0x60), vt_rd(vg_cbp, 0x68), vt_rd(vg_smmu, 0x48));
+ 	}
++	printf("VAYU TOUCH: SE clk_sel %#x m_clk %#x word %#x tx_pack %#x/%#x tx_len %#x rx_len %#x cpha %#x cpol %#x tx_fifo %#x rx_fifo %#x dma_tx_attr %#x\n",
++	    vt_rd(vt.se, 0x07c), vt_rd(vt.se, 0x048), vt_rd(vt.se, 0x268), vt_rd(vt.se, 0x260), vt_rd(vt.se, 0x264),
++	    vt_rd(vt.se, 0x26c), vt_rd(vt.se, 0x270), vt_rd(vt.se, SE_SPI_CPHA), vt_rd(vt.se, SE_SPI_CPOL), vt_rd(vt.se, 0x800),
++	    vt_rd(vt.se, 0x804), vt_rd(vt.se, 0xc38));
+ 	printf("VAYU TOUCH: GPII%u irq type %#x ch %#x ev %#x ieob %#x glob %#x gpii %#x\n", VT_GPII,
+ 	    vt_rd(vg.gpi, 0x23080u + b), vt_rd(vg.gpi, 0x23090u + b), vt_rd(vg.gpi, 0x23094u + b),
+ 	    vt_rd(vg.gpi, 0x230b0u + b), vt_rd(vg.gpi, 0x23100u + b), vt_rd(vg.gpi, 0x23118u + b));
+-- 
+2.53.0
+

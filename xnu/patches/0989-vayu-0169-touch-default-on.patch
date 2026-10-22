@@ -1,0 +1,32 @@
+From 8db01644301d4a90c0914c9cfd4fb5cbcf3aaebe Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 13:35:02 +0200
+Subject: [PATCH] vayu-0169: touch GPI path on by default (vayutouchgpi=0
+ disables)
+
+---
+ bsd/dev/vayu_touch.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 92f1507..75f61ae 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -341,11 +341,11 @@ vt_se_init(void)
+ 	vt_wr(vt.se, SE_M_IRQ_EN, M_CMD_DONE | M_ERRORS);
+ 	if (gsi_only) {
+ 		printf("VAYU TOUCH: SE17 FIFO interface disabled by its firmware: GPI DMA mode\n");
+-		int gpi_on = 0;
++		/* 0168: touch works over the GPI; vayutouchgpi=0 turns it off */
++		int gpi_on = 1;
+ 		(void)PE_parse_boot_argn("vayutouchgpi", &gpi_on, sizeof(gpi_on));
+ 		if (!gpi_on) {
+-			/* experimental: GPI command writes reset the phone so far (0153-0157) */
+-			printf("VAYU TOUCH: GPI path off (boot-arg vayutouchgpi=1 to try); no touch\n");
++			printf("VAYU TOUCH: GPI path off (vayutouchgpi=0); no touch\n");
+ 			return false;
+ 		}
+ 		sweet_log_flush_now();
+-- 
+2.53.0
+

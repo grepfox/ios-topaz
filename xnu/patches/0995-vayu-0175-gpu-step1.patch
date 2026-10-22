@@ -1,0 +1,235 @@
+From 9fde7d61bcbcfb62387b97d4e07ec2c4ba9e6a98 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 14:22:27 +0200
+Subject: [PATCH] vayu-0175: Adreno 640 bring-up step 1 (vayugpu=1): GCC GPU
+ clocks, CX GDSC, GMU 200 MHz + GPUCC clocks, read-only GMU register dump
+
+---
+ bsd/conf/files       |   1 +
+ bsd/dev/vayu_gpu.c   | 181 +++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/vayu_touch.c |   2 +
+ 3 files changed, 184 insertions(+)
+ create mode 100644 bsd/dev/vayu_gpu.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index abe18f9..3054673 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/vayu_touch.c			standard
++bsd/dev/vayu_gpu.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+new file mode 100644
+index 0000000..13f5674
+--- /dev/null
++++ b/bsd/dev/vayu_gpu.c
+@@ -0,0 +1,181 @@
++/*
++ * vayu (Poco X3 Pro, SM8150) Adreno 640 bring-up, step 1: power and clocks
++ * for the GMU side only, then read-only register dumps. Nothing is started.
++ *
++ * Reference (read-only): YAAP kernel drivers/gpu/msm (KGSL: kgsl_gmu.c
++ * gmu_start -> gmu_enable_gdsc, gmu_enable_clks), drivers/clk/qcom
++ * gpucc-sm8150.c / gcc-sm8150.c, base DT qcom,kgsl-3d0@2C00000 and
++ * qcom,gmu@0x2C6A000. Register numbers in a6xx_reg.h are 32-bit word
++ * offsets from the GPU base 0x2c00000 (GX GDSCR 0x24403 -> 0x2c9100c).
++ *
++ * Opt-in: boot-arg vayugpu=1 (default off). Runs 60 s after start so a
++ * hang or reset shows up after the GUI is up and the log has flushed.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_log_flush_now(void);
++void vayu_gpu_init(void);
++
++#define VG_GCC_PA     0x00100000u
++#define VG_GCC_SIZE   0x00080000u
++#define VG_GPU_PA     0x02c00000u    /* KGSL word offsets are from here */
++#define VG_GPU_SIZE   0x000a0000u    /* GPU 0x40000 + CX DBGC + GMU + GPUCC */
++#define VG_GPUCC      0x00090000u    /* gpucc 0x2c90000 inside the GPU window */
++
++/* GCC (gcc-sm8150.c) */
++#define GCC_GPU_VOTE        0x52004u   /* BIT15 gpu_gpll0, BIT16 gpu_gpll0_div */
++#define GCC_GPU_CFG_AHB     0x71004u
++#define GCC_GPU_MEMNOC_GFX  0x7100cu
++#define GCC_GPU_SNOC_DVM    0x71018u
++#define GCC_DDRSS_GPU_AXI   0x71154u
++
++/* GPUCC (gpucc-sm8150.c), offsets from 0x2c90000 */
++#define GPUCC_CXO_AON       0x1004u
++#define GPUCC_AHB           0x1078u
++#define GPUCC_CX_APB        0x1088u
++#define GPUCC_CX_SNOC_DVM   0x108cu
++#define GPUCC_CX_GMU        0x1098u
++#define GPUCC_CXO           0x109cu
++#define GPUCC_GX_GDSCR      0x100cu
++#define GPUCC_CX_GDSCR      0x106cu
++#define GPUCC_GMU_RCG       0x1120u    /* CMD; CFG +4: 200 MHz = GPLL0_DIV (src 6) / 1.5 */
++
++/* GMU registers (a6xx_reg.h word offsets) */
++#define GMU_REG(w)          ((uint32_t)(w) * 4u)
++
++static vm_offset_t vg_gcc, vg_gpu;
++
++static uint32_t
++rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* branch clock: set CLK_ENABLE, wait for CLK_OFF (bit 31) to clear */
++static bool
++vg_branch(vm_offset_t b, uint32_t off, const char *name)
++{
++	wr(b, off, rd(b, off) | 1u);
++	for (unsigned i = 0; i < 2000; i++) {
++		if (!(rd(b, off) & (1u << 31))) {
++			return true;
++		}
++		delay(10);
++	}
++	printf("VAYU GPU: clock %s did not start (cbcr %#x)\n", name, rd(b, off));
++	return false;
++}
++
++static void
++vg_dump(const char *when)
++{
++	vm_offset_t cc = vg_gpu + VG_GPUCC;
++	printf("VAYU GPU: %s: CX GDSCR %#x GX GDSCR %#x | gmu %#x cxo %#x ahb %#x apb %#x snoc %#x aon %#x rcg %#x/%#x\n",
++	    when, rd(cc, GPUCC_CX_GDSCR), rd(cc, GPUCC_GX_GDSCR), rd(cc, GPUCC_CX_GMU), rd(cc, GPUCC_CXO),
++	    rd(cc, GPUCC_AHB), rd(cc, GPUCC_CX_APB), rd(cc, GPUCC_CX_SNOC_DVM), rd(cc, GPUCC_CXO_AON),
++	    rd(cc, GPUCC_GMU_RCG), rd(cc, GPUCC_GMU_RCG + 4));
++	printf("VAYU GPU: %s: gcc vote %#x cfg_ahb %#x memnoc %#x snoc %#x axi %#x\n", when,
++	    rd(vg_gcc, GCC_GPU_VOTE), rd(vg_gcc, GCC_GPU_CFG_AHB), rd(vg_gcc, GCC_GPU_MEMNOC_GFX),
++	    rd(vg_gcc, GCC_GPU_SNOC_DVM), rd(vg_gcc, GCC_DDRSS_GPU_AXI));
++	sweet_log_flush_now();
++}
++
++static void
++vg_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	delay_for_interval(60, NSEC_PER_SEC);
++	vg_gcc = ml_io_map(VG_GCC_PA, VG_GCC_SIZE);
++	vg_gpu = ml_io_map(VG_GPU_PA, VG_GPU_SIZE);
++	if (!vg_gcc || !vg_gpu) {
++		printf("VAYU GPU: map failed\n");
++		return;
++	}
++	vm_offset_t cc = vg_gpu + VG_GPUCC;
++	printf("VAYU GPU: step 1 start (Adreno 640, chipid 0x6040001)\n");
++	vg_dump("before");
++
++	/* GCC side: GPLL0 (and its /2) to the GPU, config AHB, DDR paths */
++	wr(vg_gcc, GCC_GPU_VOTE, rd(vg_gcc, GCC_GPU_VOTE) | (1u << 15) | (1u << 16));
++	delay(100);
++	bool ok = vg_branch(vg_gcc, GCC_GPU_CFG_AHB, "gcc_gpu_cfg_ahb");
++	ok &= vg_branch(vg_gcc, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx");
++	ok &= vg_branch(vg_gcc, GCC_GPU_SNOC_DVM, "gcc_gpu_snoc_dvm_gfx");
++	ok &= vg_branch(vg_gcc, GCC_DDRSS_GPU_AXI, "gcc_ddrss_gpu_axi");
++	printf("VAYU GPU: step 1a: gcc clocks %s\n", ok ? "on" : "NOT all on");
++	sweet_log_flush_now();
++
++	/* CX GDSC: clear SW_COLLAPSE, wait for PWR_ON (bit 31) */
++	uint32_t g = rd(cc, GPUCC_CX_GDSCR);
++	if (!(g & (1u << 31))) {
++		wr(cc, GPUCC_CX_GDSCR, g & ~1u);
++		for (unsigned i = 0; i < 5000 && !(rd(cc, GPUCC_CX_GDSCR) & (1u << 31)); i++) {
++			delay(10);
++		}
++	}
++	printf("VAYU GPU: step 1b: CX GDSC %#x (%s)\n", rd(cc, GPUCC_CX_GDSCR),
++	    (rd(cc, GPUCC_CX_GDSCR) & (1u << 31)) ? "on" : "NOT ON");
++	sweet_log_flush_now();
++	if (!(rd(cc, GPUCC_CX_GDSCR) & (1u << 31))) {
++		return;
++	}
++
++	/* GMU clock source: 200 MHz (CFG src 6 = GPLL0_OUT_MAIN_DIV, div 1.5 -> field 2) */
++	wr(cc, GPUCC_GMU_RCG + 4, (6u << 8) | 2u);
++	wr(cc, GPUCC_GMU_RCG, rd(cc, GPUCC_GMU_RCG) | 1u);
++	for (unsigned i = 0; i < 2000 && (rd(cc, GPUCC_GMU_RCG) & 1u); i++) {
++		delay(10);
++	}
++	ok = vg_branch(cc, GPUCC_CXO_AON, "gpu_cc_cxo_aon");
++	ok &= vg_branch(cc, GPUCC_CXO, "gpu_cc_cxo");
++	ok &= vg_branch(cc, GPUCC_AHB, "gpu_cc_ahb");
++	ok &= vg_branch(cc, GPUCC_CX_APB, "gpu_cc_cx_apb");
++	ok &= vg_branch(cc, GPUCC_CX_SNOC_DVM, "gpu_cc_cx_snoc_dvm");
++	ok &= vg_branch(cc, GPUCC_CX_GMU, "gpu_cc_cx_gmu");
++	printf("VAYU GPU: step 1c: gpucc clocks %s, gmu rcg %#x/%#x\n", ok ? "on" : "NOT all on",
++	    rd(cc, GPUCC_GMU_RCG), rd(cc, GPUCC_GMU_RCG + 4));
++	vg_dump("after");
++	if (!ok) {
++		return;
++	}
++
++	/* GMU CX registers, read only */
++	printf("VAYU GPU: step 1d: GMU sysreset %#x fw_init %#x cm3_cfg %#x hfi_ctrl %#x hfi_ver %#x general0 %#x sptprac %#x ao_irq %#x\n",
++	    rd(vg_gpu, GMU_REG(0x1F800)), rd(vg_gpu, GMU_REG(0x1F81C)), rd(vg_gpu, GMU_REG(0x1F82D)),
++	    rd(vg_gpu, GMU_REG(0x1F980)), rd(vg_gpu, GMU_REG(0x1F981)), rd(vg_gpu, GMU_REG(0x1F9C5)),
++	    rd(vg_gpu, GMU_REG(0x1F8D0)), rd(vg_gpu, GMU_REG(0x23B05)));
++	printf("VAYU GPU: step 1 done\n");
++	sweet_log_flush_now();
++}
++
++void
++vayu_gpu_init(void)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("vayugpu", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(vg_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 94bba18..acbd783 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -44,6 +44,7 @@ extern void sweet_log_flush_now(void);   /* bsd/dev/sweet_ufs.c */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void vayu_touch_init(void);
+ extern void sweet_speed_start(void);
++extern void vayu_gpu_init(void);
+ extern void sweet_gov_touch(void);       /* osfmk/kern/exception.c */
+ 
+ /* GCC (gcc-sm8150.c): QUPv3 wrap2 S0 (= SE17) branch, its RCG, wrap2 AHB votes */
+@@ -1478,6 +1479,7 @@ vayu_touch_init(void)
+ 	}
+ 	vt.started = true;
+ 	sweet_speed_start();            /* osfmk/kern/exception.c: measured CPU clocks */
++	vayu_gpu_init();                /* bsd/dev/vayu_gpu.c (boot-arg vayugpu=1) */
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("vayutouchdiag", &vt.diag, sizeof(vt.diag));
+ 	if (!enabled) {
+-- 
+2.53.0
+

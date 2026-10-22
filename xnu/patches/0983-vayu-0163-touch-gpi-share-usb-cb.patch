@@ -1,0 +1,72 @@
+From aa9525b83f14949bd392dd60e0d7f029f00bb95a Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 09:41:57 +0200
+Subject: [PATCH] vayu-0163: touch GPI stream shares USB's identity SMMU
+ context bank (bypass reads back as fault)
+
+---
+ bsd/dev/vayu_touch.c | 39 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index b7d581b..51f7fbf 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -501,10 +501,41 @@ vt_smmu_identity(uint32_t sid)
+ 	 * may not reach memory at all). Tells whether the reset at the first
+ 	 * GPI command comes from its memory accesses.
+ 	 */
+-	/* 0160: bypass is the only mode where the GPI commands complete (CB8 identity and fault reset) */
+-	int mode = 1;
++	/*
++	 * 0162: S2CR bypass reads back as fault (0x20000): the GPI's memory
++	 * accesses end in BUS_ERROR. Mode 3 (default) shares the identity
++	 * context bank sweet_usb.c set up for USB stream 0x140 (CB4), which
++	 * demonstrably reaches DDR. 0 = own CB from 8 up (resets), 1 bypass, 2 fault.
++	 */
++	int mode = 3;
+ 	(void)PE_parse_boot_argn("vayugpismmu", &mode, sizeof(mode));
+ 	printf("VAYU TOUCH: SMMU before: sGFSR %#x sCR0 %#x mode %d\n", vt_rd(s, 0x48), vt_rd(s, 0x0), mode);
++	if (mode == 3) {
++		uint32_t ucb = ~0u;
++		for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++			uint32_t smr = vt_rd(s, 0x800 + 4 * i), s2cr = vt_rd(s, 0xc00 + 4 * i);
++			if ((smr >> 31) && (smr & 0x7fff) == 0x140 && ((s2cr >> 16) & 3) == 0) {
++				ucb = s2cr & 0xff;
++			}
++		}
++		if (ucb == ~0u || ucb >= ncb) {
++			printf("VAYU TOUCH: SMMU no USB context bank to share (sweetusb off?)\n");
++			return false;
++		}
++		vm_offset_t ucbp = s + (vm_offset_t)npage * psize + (vm_offset_t)ucb * psize;
++		vt_wr(s, 0xc00 + 4 * slot, ucb);
++		vt_wr(s, 0x800 + 4 * slot, (1u << 31) | sid);
++		vt_wr(s, 0x70, 0);
++		for (unsigned n = 0; n < 100000 && (vt_rd(s, 0x74) & 1) != 0; n++) {
++			delay(1);
++		}
++		vg_smmu = s;
++		vg_cbp = ucbp;
++		printf("VAYU TOUCH: SMMU stream %#x shares USB CB%u: SMR%u %08x S2CR %08x, CB SCTLR %08x CBAR %08x FSR %08x\n",
++		    sid, ucb, slot, vt_rd(s, 0x800 + 4 * slot), vt_rd(s, 0xc00 + 4 * slot), vt_rd(ucbp, 0x0),
++		    vt_rd(s + psize, 4 * ucb), vt_rd(ucbp, 0x58));
++		return true;
++	}
+ 	if (mode == 1 || mode == 2) {
+ 		vt_wr(s, 0xc00 + 4 * slot, mode == 1 ? 0x10000u : 0x20000u);
+ 		vt_wr(s, 0x800 + 4 * slot, (1u << 31) | sid);
+@@ -553,8 +584,8 @@ vg_cmd(unsigned k, uint32_t op, unsigned want)
+ {
+ 	uint32_t ctx = k < 2 ? GPI_CH_CTX(k) : GPI_EV_CTX;
+ 	if (vg_smmu) {
+-		printf("VAYU TOUCH: SMMU now: sGFSR %#x sGFSYNR0 %#x CB FSR %#x\n", vt_rd(vg_smmu, 0x48),
+-		    vt_rd(vg_smmu, 0x50), vg_cbp ? vt_rd(vg_cbp, 0x58) : 0u);
++		printf("VAYU TOUCH: SMMU now: sGFSR %#x sGFSYNR0 %#x CB FSR %#x FAR %#x\n", vt_rd(vg_smmu, 0x48),
++		    vt_rd(vg_smmu, 0x50), vg_cbp ? vt_rd(vg_cbp, 0x58) : 0u, vg_cbp ? vt_rd(vg_cbp, 0x60) : 0u);
+ 	}
+ 	printf("VAYU TOUCH: GPI cmd %u to %s%u: writing %#x (glob %#x gpii %#x err %#x)\n", op,
+ 	    k < 2 ? "ch" : "ev", k < 2 ? k : 0u, k < 2 ? GPI_CH_CMD : GPI_EV_CMD,
+-- 
+2.53.0
+

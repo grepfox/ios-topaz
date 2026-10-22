@@ -1,0 +1,170 @@
+From 7b24a52551fa7065edfcb74afe38317215819070 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 13:47:23 +0200
+Subject: [PATCH] vayu-0171: real battery from PM8150B (SPMI sid 2): FG gen4
+ SOC/voltage/current, SMB5 charger state
+
+---
+ bsd/dev/sweet_spmi.c              | 12 +++--
+ iokit/Kernel/arm/SweetBattery.cpp | 90 ++++++++++++++++++++++++++++---
+ 2 files changed, 93 insertions(+), 9 deletions(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..fb7b23d 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,9 +88,15 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	/*
++	 * sid 0: sweet PM6150 SMB5 + QG. sid 2: vayu PM8150B SMB5 (0x10-0x13)
++	 * and FG gen4 batt_soc/batt_info (0x40/0x41).
++	 */
++	bool ok = (sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48)) ||
++	    (sid == 2 && ((peripheral >= 0x10 && peripheral <= 0x13) ||
++	    peripheral == 0x40 || peripheral == 0x41));
++	if (!sp_ready || !out || addr > 0xffffu || !ok) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index c905753..66452dd 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -32,7 +32,7 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fVayu;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -40,6 +40,8 @@ private:
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
+ 	bool pollTopaz(void);
++	bool pollVayu(void);
++	static bool readWord2(unsigned sid, unsigned address, unsigned shadow, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -58,7 +60,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fVayu = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -370,9 +372,81 @@ SweetBattery::pollTopaz(void)
+ 	return true;
+ }
+ 
++/*
++ * vayu: PM8150B (SPMI sid 2). FG gen4 (qpnp-fg-gen4.c / fg-util.c):
++ * monotonic SOC 0x4009 (0-255, shadow 0x400a), VBATT 0x41a0 (x122.07 uV,
++ * copy 0x41a6), IBATT 0x41a2 (signed x488.281 uA, copy 0x41a8; positive =
++ * discharging). SMB5 charger as on PM6150: CHGR status 0x1006/0x1007,
++ * DCDC power path 0x110b, USBIN 0x1310. Read-only.
++ */
++bool
++SweetBattery::readWord2(unsigned sid, unsigned address, unsigned shadow, uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t a0, a1, b0, b1;
++		if (sweet_spmi_read(sid, address, &a0) || sweet_spmi_read(sid, address + 1, &a1) ||
++		    sweet_spmi_read(sid, shadow, &b0) || sweet_spmi_read(sid, shadow + 1, &b1)) {
++			return false;
++		}
++		if (a0 == b0 && a1 == b1) {
++			*value = (uint16_t)(a0 | (a1 << 8));
++			return true;
++		}
++	}
++	return false;
++}
++
++bool
++SweetBattery::pollVayu(void)
++{
++	uint8_t soc0, soc1, usb, path, charger, error;
++	uint16_t rawV, rawI;
++	bool ok = false;
++	for (unsigned t = 0; t < 4 && !ok; t++) {
++		ok = !sweet_spmi_read(2, 0x4009, &soc0) && !sweet_spmi_read(2, 0x400a, &soc1) && soc0 == soc1;
++	}
++	ok = ok && readWord2(2, 0x41a0, 0x41a6, &rawV) &&
++	    !sweet_spmi_read(2, 0x1310, &usb) && !sweet_spmi_read(2, 0x110b, &path) &&
++	    !sweet_spmi_read(2, 0x1006, &charger) && !sweet_spmi_read(2, 0x1007, &error);
++	unsigned mv = ok ? (unsigned)(((uint64_t)rawV * 122070u) / 1000000u) : 0;
++	if (!ok || mv < 2800 || mv > 4600) {
++		return false;
++	}
++	/* fg_get_msoc: 0 and 255 are the ends, 1..254 scale to 1..99 */
++	unsigned percent = soc0 == 255 ? 100 : soc0 == 0 ? 0 : (soc0 * 100u + 127u) / 255u;
++	if (soc0 != 0 && soc0 != 255) {
++		percent = percent < 1 ? 1 : percent > 99 ? 99 : percent;
++	}
++	int ma = 0;
++	bool currentValid = readWord2(2, 0x41a2, 0x41a8, &rawI);
++	if (currentValid) {
++		int sraw = (rawI & 0x8000u) ? (int)rawI - 65536 : (int)rawI;
++		/* IOPMPowerSource: positive = charging */
++		ma = (int)(-((int64_t)sraw * 488281) / 1000000);
++	}
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 && !(error & 2u);
++	bool full = external && (state == 5 || soc0 == 255) && !(error & 2u);
++	publish(full ? 100 : percent, mv, ma, external, capable, charging, full, true, currentValid);
++	static unsigned logs;
++	if (logs++ % 30 == 0) {
++		IOLog("SWEET BATTERY: vayu FG %u%% (msoc %u) %umV %dmA usb %#x path %#x chg %#x err %#x\n",
++		    percent, soc0, mv, ma, usb, path, charger, error);
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fVayu) {
++		if (!pollVayu()) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		return;
++	}
+ 	if (fReal && pollTopaz()) {
+ 		return;
+ 	}
+@@ -442,11 +516,15 @@ SweetBattery::start(IOService *provider)
+ 	 * vayu: static fallback only (PM8150B FG gen4 + SMB5 not ported; the
+ 	 * topaz gauge sits on SM6225 QUP I2C).
+ 	 */
+-	int real = sweet_soc_vayu() ? 0 : 1;
+-	if (!sweet_soc_vayu()) {
+-		(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	int real = 1;
++	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	if (sweet_soc_vayu()) {
++		/* vayu: PM8150B FG gen4 + SMB5 over SPMI (observer reads) */
++		fVayu = real == 1 && sweet_spmi_init() == 0;
++		fReal = fVayu;
++	} else {
++		fReal = real == 1 && sweet_i2c1_init() == 0;
+ 	}
+-	fReal = real == 1 && sweet_i2c1_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+-- 
+2.53.0
+

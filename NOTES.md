@@ -4,6 +4,8 @@
 
 ### >>> VAYU (Poco X3 Pro, SM8150-AC, 6 GB) 2026-10-21, branch `vayu` (read VAYU.md) <<<
 
+- **2026-10-22 MERGE (branch `vayu-merge`): upstream origin/topaz e477291 (HackiOS open-sourced: topaz patches 0140-0152 and 0900-0950, userland/ eagl + Mesa freedreno Darwin + redwood-drm + audio HAL, CREDITS.md).** Our vayu patches were renumbered **0140-0175 -> 0960-0995** (same order; file names keep the old number, e.g. `0960-vayu-0140-sm8150-platform.patch`; commit subjects still say vayu-01xx). Older notes below use the old numbers. Rebased with real ancestors (upstream 0139 tree + ours, rebased onto upstream 0950 tree); the full stack applied CI-style from bare xnu gives exactly the rebased tree (only 0031/0041 skipped, as always). Conflicts resolved in SweetFramebuffer.cpp: topaz_adreno_init() + RedwoodWaitsForGPU only when !vayu; upstream's Linux-style setPanelOn (level 0, 0x28, 0x10 / 0x11, 0x29) kept, vayu WLED goes through setPanelLevel; vsync = our sweetfb_vsync rate + upstream sweetfb_lock. TOPAZ_4K (4K pages, AMP) is a build flag that CI does not set: vayu stays 16K.
+
 Different user and phone from the topaz/sweet entries below. Repo fork for CI: `grepfox/ios-topaz` (remote `fork`), branch `vayu`. The phone was NOT connected; nothing has been booted. All hardware values come from the MIUI V14.0.3.0 dump at `~/y/miui/miui_VAYUGlobal_V14.0.3.0.TJUMIXM_6be397120d_13.0` (base DTB `boot/dtb.img` entry "SM8150P v2", dtbo entry "VAYU"). User: bootloader unlocked, 6 GB model.
 
 - Commits: `806f2e4` (xnu 0140 vayu platform), `807d579` (shim/ADT/kbuild vayu target), then docs.

@@ -1,0 +1,32 @@
+From 110fd7aab43bc2c0dad7d14bae7c27d0c9779743 Mon Sep 17 00:00:00 2001
+From: grep <grepfox@tutamail.com>
+Date: Thu, 22 Oct 2026 10:52:47 +0200
+Subject: [PATCH] vayu-0165: touch GPI INTSET=1 (wired IRQ, not MSI to address
+ 0), clear error log
+
+---
+ bsd/dev/vayu_touch.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 3ca5298..7f5c7fe 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -809,7 +809,13 @@ vg_init(void)
+ 		vt_wr(vg.gpi, 0x2318Cu + b, 0);
+ 		vt_wr(vg.gpi, 0x23400u + b, 0);         /* SCRATCH_0/1 */
+ 		vt_wr(vg.gpi, 0x23404u + b, 0);
+-		vt_wr(vg.gpi, 0x23180u + b, 0);         /* INTSET (0, as gpi_config_interrupts) */
++		/*
++		 * INTSET 1 = wired IRQ (gpi_config_interrupts enable path). 0164:
++		 * with 0 (MSI, base 0) the GPI wrote its first interrupt to IOVA 0
++		 * (SMMU write fault FAR 0) and stopped with BUS_ERROR.
++		 */
++		vt_wr(vg.gpi, 0x23180u + b, 1);
++		vt_wr(vg.gpi, GPI_ERR_LOG, 0);
+ 		printf("VAYU TOUCH: GPI step 3d: irq config done\n");
+ 		sweet_log_flush_now();
+ 	}
+-- 
+2.53.0
+

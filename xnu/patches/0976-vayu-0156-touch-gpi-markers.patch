@@ -1,0 +1,69 @@
+From 7e8cca1aa88cb57b3edf3878b6af12a30e9265fa Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 21:45:09 +0200
+Subject: [PATCH] vayu-0156: touch GPI: flushed marker around every command and
+ context write
+
+0155: the reset happens in step 4 (event ring alloc + programming +
+channel alloc) after SMMU CB8/SMR8 and GSI mode succeeded and GPII1
+reads showed free channels. Mark each write with GLOB/GPII IRQ status
+and the error log, flushed to flash.
+---
+ bsd/dev/vayu_touch.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index b7ad782..3583f00 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -516,9 +516,18 @@ static bool
+ vg_cmd(unsigned k, uint32_t op, unsigned want)
+ {
+ 	uint32_t ctx = k < 2 ? GPI_CH_CTX(k) : GPI_EV_CTX;
++	printf("VAYU TOUCH: GPI cmd %u to %s%u: writing %#x (glob %#x gpii %#x err %#x)\n", op,
++	    k < 2 ? "ch" : "ev", k < 2 ? k : 0u, k < 2 ? GPI_CH_CMD : GPI_EV_CMD,
++	    vt_rd(vg.gpi, 0x23100u + 0x4000u * VT_GPII), vt_rd(vg.gpi, 0x23118u + 0x4000u * VT_GPII),
++	    vt_rd(vg.gpi, GPI_ERR_LOG));
++	sweet_log_flush_now();
+ 	vt_wr(vg.gpi, k < 2 ? GPI_CH_CMD : GPI_EV_CMD, (op << 24) | (k < 2 ? k : 0u));
++	printf("VAYU TOUCH: GPI cmd written\n");
++	sweet_log_flush_now();
+ 	for (unsigned i = 0; i < 1000; i++) {
+ 		if (vg_state(ctx) == want) {
++			printf("VAYU TOUCH: GPI cmd %u done: state %u after %u x 100 us\n", op, want, i);
++			sweet_log_flush_now();
+ 			return true;
+ 		}
+ 		delay(100);
+@@ -603,6 +612,8 @@ vg_init(void)
+ 	if (!vg_cmd(2, GPI_CMD_ALLOC, 1)) {
+ 		return false;
+ 	}
++	printf("VAYU TOUCH: GPI step 4b: event context\n");
++	sweet_log_flush_now();
+ 	vt_wr(vg.gpi, GPI_EV_CTX + CTX_CONFIG, (16u << 24) | (1u << 16) | 2u);
+ 	vt_wr(vg.gpi, GPI_EV_CTX + CTX_LEN, VD_EV_N * 16u);
+ 	vt_wr(vg.gpi, GPI_EV_CTX + CTX_BASE_LO, (uint32_t)(vg.pa + VD_EVR));
+@@ -615,13 +626,19 @@ vg_init(void)
+ 	vt_wr(vg.gpi, GPI_EV_CTX + CTX_RPU_HI, 0);
+ 	vg.ev_rp = 0;
+ 	vg.ev_wp = VD_EV_N - 1u;
++	printf("VAYU TOUCH: GPI step 4c: event doorbell\n");
++	sweet_log_flush_now();
+ 	vt_wr(vg.gpi, GPI_EV_DB, (uint32_t)(vg.pa + VD_EVR + 16u * vg.ev_wp));
++	printf("VAYU TOUCH: GPI step 4d: event ring ready (err %#x)\n", vt_rd(vg.gpi, GPI_ERR_LOG));
++	sweet_log_flush_now();
+ 	/* channels: 0 = TX (OUT), 1 = RX (IN), paired, protocol SPI (1), SE 0 */
+ 	for (unsigned k = 0; k < 2; k++) {
+ 		uint32_t ring = k == 0 ? VD_TXR : VD_RXR;
+ 		if (!vg_cmd(k, GPI_CMD_ALLOC, 1)) {
+ 			return false;
+ 		}
++		printf("VAYU TOUCH: GPI step 4e: ch%u context\n", k);
++		sweet_log_flush_now();
+ 		vt_wr(vg.gpi, GPI_CH_CTX(k) + CTX_CONFIG, (16u << 24) | (0u << 14) | ((k == 0 ? 1u : 0u) << 3) | 2u);
+ 		vt_wr(vg.gpi, GPI_CH_CTX(k) + CTX_LEN, VD_RING_N * 16u);
+ 		vt_wr(vg.gpi, GPI_CH_CTX(k) + CTX_BASE_LO, (uint32_t)(vg.pa + ring));
+-- 
+2.53.0
+

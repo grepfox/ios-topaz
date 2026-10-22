@@ -1,0 +1,80 @@
+From b7bb16c4e814deff9c7492fce1656fef63299ea4 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 21:56:59 +0200
+Subject: [PATCH] vayu-0157: touch: pick a clean GPII instead of GPII1
+
+0156: the first write to GPII1's event command register (0x27010) reset
+the phone; GPII1's error log already read 0x2468083b, so another owner
+uses it. Read every GPII in gpii-mask 0xfa (state, error log, scratch),
+use the first idle one with a clean error log (vayugpii= overrides),
+refuse if none.
+---
+ bsd/dev/vayu_touch.c | 38 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index 3583f00..2db6138 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -146,7 +146,7 @@ void vayu_touch_init(void);
+ /* QUPv3 wrap2 GPI DMA (gpi-dma@0xc00000, msm_gpi_mmio.h), GPII 1 */
+ #define VT_GPI_PA        0x00c00000u
+ #define VT_GPI_SIZE      0x00060000u
+-#define VT_GPII          1u
++#define VT_GPII          vg_gpii         /* chosen at runtime (0156: GPII1 writes reset the phone) */
+ #define VT_GPI_SID       0x7b6u          /* iommus = <&apps_smmu 0x7b6 0> */
+ #define GPI_CH_CTX(k)    (0x20000u + 0x4000u * VT_GPII + 0x80u * (k))
+ #define GPI_EV_CTX       (0x21000u + 0x4000u * VT_GPII)
+@@ -202,6 +202,8 @@ static struct {
+ static int vt_sleep_chan;
+ static uint8_t vt_tx[NVT_XFER + 8], vt_rx[NVT_XFER + 8];
+ 
++static unsigned vg_gpii = 1;
++
+ static struct {
+ 	bool on;                        /* transfers go through GPI */
+ 	bool cfg_sent;                  /* CONFIG0 TRE queued once */
+@@ -587,7 +589,39 @@ vg_init(void)
+ 	vt_wr(vt.se, SE_DMA_RX_CLR, 0xffffffffu);
+ 	vt_wr(vt.se, SE_DMA_MODE, vt_rd(vt.se, SE_DMA_MODE) | 1u);
+ 	vt_wr(vt.se, SE_GSI_EVENT_EN, vt_rd(vt.se, SE_GSI_EVENT_EN) | 0xfu);
+-	printf("VAYU TOUCH: GPI step 3: reading GPII%u state\n", VT_GPII);
++	/*
++	 * Which GPII? gpii-mask 0xfa allows 1, 3-7; Linux takes the first one no
++	 * other client holds. 0156: GPII1 had error log 0x2468083b before we
++	 * touched it and the first command write reset the phone. Read (only)
++	 * every candidate and take the first idle one with a clean error log.
++	 */
++	unsigned pick = 0;
++	for (unsigned n = 1; n < 8; n++) {
++		if (!((0xfau >> n) & 1u)) {
++			continue;
++		}
++		uint32_t base = 0x4000u * n;
++		uint32_t ev = (vt_rd(vg.gpi, 0x21000u + base) >> 20) & 0xfu;
++		uint32_t c0 = (vt_rd(vg.gpi, 0x20000u + base) >> 20) & 0xfu;
++		uint32_t c1 = (vt_rd(vg.gpi, 0x20080u + base) >> 20) & 0xfu;
++		uint32_t err = vt_rd(vg.gpi, 0x23200u + base);
++		uint32_t scr = vt_rd(vg.gpi, 0x20060u + base);
++		printf("VAYU TOUCH: GPII%u ev %u ch0 %u ch1 %u err %#x ch0 scratch0 %#x\n", n, ev, c0, c1, err, scr);
++		if (!pick && ev == 0 && c0 == 0 && c1 == 0 && err == 0) {
++			pick = n;
++		}
++	}
++	int want = 0;
++	if (PE_parse_boot_argn("vayugpii", &want, sizeof(want)) && want > 0 && want < 8) {
++		pick = (unsigned)want;
++	}
++	if (!pick) {
++		printf("VAYU TOUCH: no clean GPII; not touching the GPI\n");
++		sweet_log_flush_now();
++		return false;
++	}
++	vg_gpii = pick;
++	printf("VAYU TOUCH: GPI step 3: using GPII%u\n", VT_GPII);
+ 	sweet_log_flush_now();
+ 	printf("VAYU TOUCH: GPI GPII%u states ev %u ch0 %u ch1 %u, dma %#llx; SE dma_mode %#x gsi_ev %#x\n",
+ 	    VT_GPII, vg_state(GPI_EV_CTX), vg_state(GPI_CH_CTX(0)), vg_state(GPI_CH_CTX(1)), vg.pa,
+-- 
+2.53.0
+

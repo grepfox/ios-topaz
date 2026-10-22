@@ -62,7 +62,7 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - **0161 result (paste A3HGKuZX0S):** same stall, rebooted before the lock screen. New dump: GPII_IRQ_STTS = 0x2 = **BUS_ERROR** (already set right after the event ring doorbell, before any channel), SE idle (geni_status 0, no M/S/DMA irqs), ch0 CNTXT_0 0x1050001a (state 5), scratch0 top byte set by the GSI (0x18 / 0x19). STOP/RESET do nothing in state 5, so the teardown left ch0 stuck (ev back to allocated only). Guess: GPI master has no NoC path to DDR.
 - **0162:** `sweet_rpmh_bcm_vote()` (sweet_rpmh.c generalized: lookup by slave type, n commands) and an ACTIVE vote BCM "QUP0" (x=1,y=1, commit) before the GPI (`vayuqupbcm=0` skips). Logs gpii irq after the event doorbell. CI 39739630577 ok; image vayu-0162-touch.img (vayutouchgpi=1) https://gofile.io/d/sMWLMVnS, awaiting log.
 - **0162 result (paste mYa_ZYCxuO):** BCM QUP0 vote works (cmd-db QUP0 addr 0x50080, TCS0 done, cmd-status 0x10101) but BUS_ERROR is unchanged. Key: the "bypass" S2CR write (0x10000) **reads back 0x20000 = fault** (hypervisor refuses bypass), so 0160 testA was also fault-type, just non-fatal. USB's identity bank works: `SMR4 80000140 S2CR 4, CB4 SCTLR e0`. Own CB8 (same writes) reset the phone in 0159.
-- **0163:** `vayugpismmu=3` (default): GPI stream 0x7b6 SMR8 -> USB's CB (looked up from the 0x140 SMR). Logs CB SCTLR/CBAR/FSR and FAR before each command.
+- **0163:** `vayugpismmu=3` (default): GPI stream 0x7b6 SMR8 -> USB's CB (looked up from the 0x140 SMR). Logs CB SCTLR/CBAR/FSR and FAR before each command. CI 39742347932 ok; image vayu-0163-touch.img (vayutouchgpi=1) https://gofile.io/d/20rRl5Zr, awaiting log.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

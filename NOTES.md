@@ -75,6 +75,8 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - **0168:** chip id byte0 0x0c -> NT36675 map: event buf 0x22D00, CRC length writes 4 bytes ((size>>16)&1). Logs the chosen map. CI 39768746268 ok; image vayu-0168-touch.img (vayutouchgpi=1) https://gofile.io/d/qw9J0F8i, awaiting log.
 - **0168 result: TOUCH WORKS** (user report 2026-10-22, lock screen swipe works; log not pulled). Working chain: SE17 GSI mode, BCM QUP0 vote, own stage-1 SMMU CB (8+) with TCR2 SEP_UPSTREAM mapping only the DMA buffer for streams 0x7b6 (GPI) and 0x7a3 (QUP SE), GPII1 interrupts with INTSET=1, NT36675 map (event buf 0x22D00, hw_crc 2).
 - **0169:** GPI touch on by default (`vayutouchgpi=0` disables). Pending CI + image.
+- User 2026-10-22: everything laggy (no GPU: CoreAnimation renders on the CPU, Adreno 640 not started). Plan agreed: check real CPU clocks, try `sweetfb_hz=60`, then battery and other bugs.
+- **0170:** `SWEET SPEED[0/1]` at ~40 s and ~180 s after touch start: each domain's PERF_STATE (+0x920), its LUT row -> MHz, and a measured MHz per CPU (16 dependent adds per loop vs mach_absolute_time, thread bound per CPU). Code in osfmk/kern/exception.c (`sweet_speed_start`, needs cpu_to_processor/thread_bind), started from vayu_touch_init.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

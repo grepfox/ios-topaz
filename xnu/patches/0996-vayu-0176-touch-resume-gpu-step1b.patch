@@ -1,0 +1,131 @@
+From 27314f17b190661f34e4f474dad1f446a66b434f Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 16:26:44 +0200
+Subject: [PATCH] vayu-0176: TDDI touch suspend/resume with the panel (firmware
+ reload after sleep-out); GPU step 1 waits 200 ms per clock, cx_apb optional
+
+---
+ bsd/dev/vayu_gpu.c                    |  8 +++---
+ bsd/dev/vayu_touch.c                  | 36 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  8 ++++++
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 13f5674..5588aa5 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -74,7 +74,8 @@ static bool
+ vg_branch(vm_offset_t b, uint32_t off, const char *name)
+ {
+ 	wr(b, off, rd(b, off) | 1u);
+-	for (unsigned i = 0; i < 2000; i++) {
++	/* 0175 log: memnoc_gfx / snoc_dvm_gfx needed more than 20 ms */
++	for (unsigned i = 0; i < 20000; i++) {
+ 		if (!(rd(b, off) & (1u << 31))) {
+ 			return true;
+ 		}
+@@ -119,7 +120,7 @@ vg_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	ok &= vg_branch(vg_gcc, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx");
+ 	ok &= vg_branch(vg_gcc, GCC_GPU_SNOC_DVM, "gcc_gpu_snoc_dvm_gfx");
+ 	ok &= vg_branch(vg_gcc, GCC_DDRSS_GPU_AXI, "gcc_ddrss_gpu_axi");
+-	printf("VAYU GPU: step 1a: gcc clocks %s\n", ok ? "on" : "NOT all on");
++	printf("VAYU GPU: step 1a: gcc clocks %s\n", ok ? "on" : "NOT all on (going on)");
+ 	sweet_log_flush_now();
+ 
+ 	/* CX GDSC: clear SW_COLLAPSE, wait for PWR_ON (bit 31) */
+@@ -146,7 +147,8 @@ vg_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	ok = vg_branch(cc, GPUCC_CXO_AON, "gpu_cc_cxo_aon");
+ 	ok &= vg_branch(cc, GPUCC_CXO, "gpu_cc_cxo");
+ 	ok &= vg_branch(cc, GPUCC_AHB, "gpu_cc_ahb");
+-	ok &= vg_branch(cc, GPUCC_CX_APB, "gpu_cc_cx_apb");
++	/* cx_apb kept CBCR 0x80000000 (enable bit not latched): optional for the GMU reads */
++	(void)vg_branch(cc, GPUCC_CX_APB, "gpu_cc_cx_apb");
+ 	ok &= vg_branch(cc, GPUCC_CX_SNOC_DVM, "gpu_cc_cx_snoc_dvm");
+ 	ok &= vg_branch(cc, GPUCC_CX_GMU, "gpu_cc_cx_gmu");
+ 	printf("VAYU GPU: step 1c: gpucc clocks %s, gmu rcg %#x/%#x\n", ok ? "on" : "NOT all on",
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index acbd783..ae84395 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -43,6 +43,28 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern void sweet_log_flush_now(void);   /* bsd/dev/sweet_ufs.c */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void vayu_touch_init(void);
++void vayu_touch_suspend(void);
++void vayu_touch_resume(void);
++/*
++ * The NT36672C is a TDDI: the panel's sleep-in (DCS 0x10, SweetFramebuffer
++ * setPanelOn(false)) also stops the touch MCU and its RAM firmware is gone
++ * after sleep-out. Like nvt_ts_suspend/resume: stop polling while the panel
++ * sleeps, download the firmware again once it is awake.
++ */
++static volatile int vt_suspended, vt_resume_req;
++
++void
++vayu_touch_suspend(void)
++{
++	vt_suspended = 1;
++}
++
++void
++vayu_touch_resume(void)
++{
++	vt_resume_req = 1;
++	vt_suspended = 0;
++}
+ extern void sweet_speed_start(void);
+ extern void vayu_gpu_init(void);
+ extern void sweet_gov_touch(void);       /* osfmk/kern/exception.c */
+@@ -1427,6 +1449,20 @@ vt_thread(void *arg __unused, wait_result_t wr __unused)
+ 	unsigned errs = 0;
+ 	for (;;) {
+ 		vt_sleep(8);
++		if (vt_suspended) {
++			if (vt.active) {
++				vt_report(0, x, y);     /* lift every finger */
++			}
++			vt_sleep(40);
++			continue;
++		}
++		if (vt_resume_req) {
++			vt_resume_req = 0;
++			int rerr = nvt_download(fw, fwsize);
++			(void)nvt_set_page(NVT_EVENT_BUF);
++			printf("VAYU TOUCH: resume: firmware %s reloaded -> %d\n", fwname, rerr);
++			continue;
++		}
+ 		pd[0] = 0;
+ 		if (nvt_read(pd, NVT_POINT_LEN + 1) != 0) {
+ 			if ((errs++ % 100u) == 0) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e9351dc..f70787f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,6 +97,8 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int sweet_soc_vayu(void);       /* osfmk/arm64/sweet_early.c */
+ extern "C" int sweet_spmi_init(void);      /* bsd/dev/sweet_spmi.c */
+ extern "C" void sweet_gov_screen(int on);  /* osfmk/kern/exception.c */
++extern "C" void vayu_touch_suspend(void);  /* bsd/dev/vayu_touch.c */
++extern "C" void vayu_touch_resume(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ 
+@@ -1728,9 +1730,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLockUnlock(fFB->fLock);
+ 			if (changed && fFB->fDsi != NULL) {
+ 				if (off) {
++					if (sweet_soc_vayu()) {
++						vayu_touch_suspend();   /* TDDI: touch sleeps with the panel */
++					}
+ 					fFB->setPanelOn(false);
+ 				} else {
+ 					fFB->setPanelOn(true);
++					if (sweet_soc_vayu()) {
++						vayu_touch_resume();    /* reload the touch firmware */
++					}
+ 					fFB->fBlSent = level;
+ 					fFB->setPanelLevel(level);
+ 				}
+-- 
+2.53.0
+

@@ -1,0 +1,103 @@
+From 125c2bde24e5a0985223a0f4ce0617c2a4bd05fb Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 20:47:57 +0200
+Subject: [PATCH] vayu-0181: GPU step 3 perf vote before OOB GPU, 2 s wait with
+ GX GDSCR trace + HFI queue dump; governor follows the load with the display
+ off (forced min froze the first boot)
+
+---
+ bsd/dev/vayu_gpu.c     | 47 ++++++++++++++++++++++++++++--------------
+ osfmk/kern/exception.c |  9 +++++++-
+ 2 files changed, 40 insertions(+), 16 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 8cae198..0702228 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -803,31 +803,48 @@ vg_step3(void)
+ 	printf("VAYU GPU: step 3e: GMU started its core firmware\n");
+ 	sweet_log_flush_now();
+ 
+-	/* 3f: OOB GPU (HFI branch != 0: set BIT(30), check BIT(31)) */
++	/*
++	 * 3f: default DCVS level first (KGSL gmu_start -> kgsl_pwrctrl_set_
++	 * default_gpu_pwrlevel -> GX_BW_PERF_VOTE), then OOB GPU (adreno_start).
++	 * 1000 boot: OOB first timed out after 100 ms with GX GDSCR 0x8222000
++	 * (collapse cleared, not powered).
++	 */
+ 	vm_offset_t cc = vg_gpu + VG_GPUCC;
+-	printf("VAYU GPU: step 3f: OOB GPU request (GX GDSCR %#x)\n", rd(cc, GPUCC_GX_GDSCR));
++	uint32_t vote[4] = { HFI_CMD(30, 16), 1, 1, 0xFF };     /* blocking ack, freq index 1 = 257 MHz */
++	int verr = vg_hfi_cmd(vote, ack, 16, "GX_BW_PERF_VOTE 257 MHz");
++	printf("VAYU GPU: step 3f: perf vote %d, GX GDSCR %#x; OOB GPU request\n", verr, rd(cc, GPUCC_GX_GDSCR));
+ 	sweet_log_flush_now();
+-	gmu_wr(0x1F994, 1u << 30);
+-	uint32_t info = 0;
+-	for (unsigned t = 0; t < 1000 && !((info = gmu_rd(0x1F992)) & (1u << 31)); t++) {
++	gmu_wr(0x1F994, 1u << 30);              /* HOST2GMU_INTR_SET: OOB GPU set (HFI branch != 0) */
++	uint32_t info = 0, last = rd(cc, GPUCC_GX_GDSCR);
++	for (unsigned t = 0; t < 20000 && !((info = gmu_rd(0x1F992)) & (1u << 31)); t++) {   /* 2 s */
++		uint32_t g = rd(cc, GPUCC_GX_GDSCR);
++		if (g != last) {
++			printf("VAYU GPU: GX GDSCR %#x -> %#x after %u x 100 us\n", last, g, t);
++			last = g;
++		}
+ 		delay(100);
+ 	}
+ 	gmu_wr(0x1F991, 1u << 31);
+-	printf("VAYU GPU: step 3f: OOB GPU %s (intr info %#x), GX GDSCR %#x, GX domain misc %#x\n",
+-	    (info & (1u << 31)) ? "acked" : "TIMED OUT", info, rd(cc, GPUCC_GX_GDSCR), gmu_rd(0x24542));
+-	sweet_log_flush_now();
+-	if (!(info & (1u << 31))) {
+-		return false;
++	printf("VAYU GPU: step 3g: OOB GPU %s (intr info %#x), GX GDSCR %#x, GX domain misc %#x, AO irq %#x, GMU general0 %#x\n",
++	    (info & (1u << 31)) ? "acked" : "TIMED OUT", info, rd(cc, GPUCC_GX_GDSCR), gmu_rd(0x24542),
++	    gmu_rd(0x23B05), gmu_rd(0x1F9C5));
++	{
++		uint32_t m[64];
++		int k;
++		while ((k = vg_hfi_read(1, m, 64)) > 0) {
++			printf("VAYU GPU: HFI msg %08x %08x %08x %08x %08x (n %d)\n", m[0], m[1], m[2], m[3], m[4], k);
++		}
++		while ((k = vg_hfi_read(2, m, 64)) > 0) {
++			printf("VAYU GPU: HFI debug %08x %08x %08x %08x %08x (n %d)\n", m[0], m[1], m[2], m[3], m[4], k);
++		}
+ 	}
+-	/* 3g: GX_BW_PERF_VOTE: lowest real level (257 MHz), bw unchanged; blocking ack */
+-	uint32_t vote[4] = { HFI_CMD(30, 16), 1, 1, 0xFF };
+-	int verr = vg_hfi_cmd(vote, ack, 16, "GX_BW_PERF_VOTE 257 MHz");
++	sweet_log_flush_now();
+ 	bool gx_on = (rd(cc, GPUCC_GX_GDSCR) & (1u << 31)) != 0;
+-	printf("VAYU GPU: step 3g: vote %d, GX GDSCR %#x (%s)\n", verr, rd(cc, GPUCC_GX_GDSCR), gx_on ? "GX on" : "GX off");
++	printf("VAYU GPU: step 3h: GX GDSCR %#x (%s)\n", rd(cc, GPUCC_GX_GDSCR), gx_on ? "GX on" : "GX off");
+ 	sweet_log_flush_now();
+ 	if (gx_on) {
+ 		/* first GPU (GX) register reads: RBBM_STATUS 0x210, RBBM_INT_0_STATUS 0x201, CP_HW_FAULT 0x821 */
+-		printf("VAYU GPU: step 3h: GPU RBBM_STATUS %#x RBBM_INT_0_STATUS %#x CP_HW_FAULT %#x\n",
++		printf("VAYU GPU: step 3i: GPU RBBM_STATUS %#x RBBM_INT_0_STATUS %#x CP_HW_FAULT %#x\n",
+ 		    rd(vg_gpu, 4 * 0x210), rd(vg_gpu, 4 * 0x201), rd(vg_gpu, 4 * 0x821));
+ 	}
+ 	sweet_log_flush_now();
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 1cdcbfb..6523c8b 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1344,7 +1344,14 @@ sweet_gov_thread(__unused void *arg, __unused wait_result_t wr)
+ 		for (unsigned d = 0; d < 3; d++) {
+ 			uint32_t top = gov_dom[d].nrow - 1, row = top;
+ 			if (off && !boost) {
+-				row = 0;
++				/*
++				 * Screen off: follow the load (x1.25, no floor). 1000 boot: the
++				 * forced lowest row with 100% load (first boot of a new root:
++				 * migration, LaunchServices, indexing) froze the phone.
++				 */
++				uint64_t want = ((uint64_t)gov_dom[d].khz[top] * load[d]) / 800u;
++				for (row = 0; row < top && gov_dom[d].khz[row] < want; row++) {
++				}
+ 			} else if (!boost && gov_on == 1 && load[d] < 500) {
+ 				/*
+ 				 * 0998 boot: x1.25 headroom and 60 ms down left the UI (CPU
+-- 
+2.53.0
+

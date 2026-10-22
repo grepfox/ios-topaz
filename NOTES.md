@@ -68,7 +68,7 @@ Different user and phone from the topaz/sweet entries below. Repo fork for CI: `
 - **0164 result (paste c9vcPjRYfO): no reset, lock screen.** Stage-1 CB8 works (SCTLR 21, TCR 00803519, TTBR0 c4fc8000, one 2M block c4e00000). After the event doorbell: CB FSR 0x402 (TF), **FAR 0, FSYNR0 0x3e0011 (write)** -> GPII BUS_ERROR, ch0 state 5. Cause: we wrote INTSET (0x23180) = 0 = MSI mode with MSI base 0, copied from Linux's *disable* path; Linux's enable path writes INTSET = 1 and ERROR_LOG = 0.
 - **0165:** INTSET = 1, ERROR_LOG cleared, rest as 0164 (stage-1 default). CI 39751119471 ok; image vayu-0165-touch.img (vayutouchgpi=1) https://gofile.io/d/nmI2W35y, awaiting log.
 - **0165 result (paste t10XUIum4f):** lock screen, no touch. INTSET fix worked: no fault/BUS_ERROR after the event doorbell (gpii irq 0, err 0). First transfer: CB FSR 0x402 TF, **FAR = TX ring base c4f98000 (read), FSYNR0 PLVL 0**, then BUS_ERROR, ch0 state 5. Cause: CB TCR2 written as 2 (SEP = 0 = bit 31), so IOVAs with bit 31 set select TTBR1, which EPD1 disables -> level-0 fault. Linux arm-smmu.c: TCR2 |= TTBCR2_SEP_UPSTREAM (7<<15) | TTBCR2_AS.
-- **0166:** TCR2 = 0x38012 (PA 40-bit, AS, SEP upstream); readback logged.
+- **0166:** TCR2 = 0x38012 (PA 40-bit, AS, SEP upstream); readback logged. CI 39754357200 ok (after a no-runner rerun); image vayu-0166-touch.img (vayutouchgpi=1) https://gofile.io/d/mK6kBMad, awaiting log.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

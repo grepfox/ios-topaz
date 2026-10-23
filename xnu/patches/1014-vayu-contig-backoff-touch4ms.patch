@@ -1,0 +1,95 @@
+From e312a97d22c1814e1a1d7259488bc2c86953400a Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:08:43 +0200
+Subject: [PATCH] vayu-0194: contiguous surface backoff (5 s after a failed
+ search), touch polled every 4 ms while touched (vayutouchms=), say when a
+ fast-core lane finds its thread bound elsewhere
+
+---
+ bsd/dev/vayu_touch.c              |  7 ++++++-
+ iokit/Kernel/arm/SweetSurface.cpp | 18 +++++++++++++++++-
+ osfmk/kern/exception.c            | 10 +++++++++-
+ 3 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/vayu_touch.c b/bsd/dev/vayu_touch.c
+index ae84395..abec87f 100644
+--- a/bsd/dev/vayu_touch.c
++++ b/bsd/dev/vayu_touch.c
+@@ -1447,8 +1447,13 @@ vt_thread(void *arg __unused, wait_result_t wr __unused)
+ 	uint8_t pd[NVT_POINT_LEN + 2];
+ 	int x[NVT_FINGERS], y[NVT_FINGERS];
+ 	unsigned errs = 0;
++	unsigned poll_ms = 4;                   /* while a finger is down (vayutouchms=); 8 ms otherwise */
++	(void)PE_parse_boot_argn("vayutouchms", &poll_ms, sizeof(poll_ms));
++	if (poll_ms < 2 || poll_ms > 8) {
++		poll_ms = 4;
++	}
+ 	for (;;) {
+-		vt_sleep(8);
++		vt_sleep(vt.active ? poll_ms : 8);
+ 		if (vt_suspended) {
+ 			if (vt.active) {
+ 				vt_report(0, x, y);     /* lift every finger */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0f1db06..ae93f13 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -45,6 +45,8 @@
+ #include <libkern/c++/OSUnserialize.h>
+ #include <libkern/c++/OSSerialize.h>
+ #include <sys/proc.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ 
+ /* topaz GPU (TopazAdreno.cpp): the GPU pool below 4 GiB */
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+@@ -1096,10 +1098,24 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 					mem = sweet_res_take(take);
+ 				}
+ 			}
+-			if (mem == NULL && gpu_low && take <= (16u << 20)) {
++			/*
++			 * A failed contiguous search scans every page twice and runs zone_gc in between (1012
++			 * log: vm_page_find_contiguous ... found 0 pages, 150-400 ms gaps in the frames as apps
++			 * opened). After one fails, sizes at least as big go to ordinary pages for 5 s.
++			 */
++			static uint64_t contig_fail_until, contig_fail_size;
++			uint64_t now = mach_absolute_time();
++			bool skip = now < contig_fail_until && take >= contig_fail_size;
++			if (mem == NULL && gpu_low && take <= (16u << 20) && !skip) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+ 				    0x0000000FFFFFC000ull);
++				if (mem == NULL) {
++					uint64_t t;
++					nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &t);
++					contig_fail_size = (now < contig_fail_until && contig_fail_size < take) ? contig_fail_size : take;
++					contig_fail_until = now + t;
++				}
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index c03b024..4f9dc88 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1295,7 +1295,15 @@ sweet_fast_core(int lane)
+ 		(void)PE_parse_boot_argn("fastcore", &c, sizeof(c));
+ 		core = (c >= 1 && c <= ml_get_max_cpu_number()) ? c : -1;
+ 	}
+-	if (core < 0 || lane < 0 || lane > 2 || core - lane < 1 || self->bound_processor != PROCESSOR_NULL) {
++	if (core < 0 || lane < 0 || lane > 2 || core - lane < 1) {
++		return;
++	}
++	if (self->bound_processor != PROCESSOR_NULL) {
++		static uint32_t seen[3];
++		if (self->bound_processor->cpu_id != core - lane && seen[lane]++ < 2) {
++			printf("SWEET GOV: thread %llu (lane %d) is bound to cpu %d already\n", thread_tid(self), lane,
++			    self->bound_processor->cpu_id);
++		}
+ 		return;
+ 	}
+ 	processor_t p = cpu_to_processor(core - lane);
+-- 
+2.53.0
+

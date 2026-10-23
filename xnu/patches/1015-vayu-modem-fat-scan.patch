@@ -1,0 +1,330 @@
+From ac629ee1b00ff45ad9a975a312d2069351723d19 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:31:21 +0200
+Subject: [PATCH] vayu-0195: TopazModem reads the modem partition's FAT16 at
+ boot (vayufwscan=0: built-in table); sampler interval sweetsamplesec=
+
+---
+ bsd/dev/sweet_sample.c          |   9 +-
+ iokit/Kernel/arm/TopazModem.cpp | 239 +++++++++++++++++++++++++++++++-
+ 2 files changed, 245 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index 4b5bf38..b0582a1 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -71,12 +71,17 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	/* first sample earlier (45 s): the init stalls are before any GUI */
++	/* first sample earlier (45 s): the init stalls are before any GUI; sweetsamplesec=N: every N s (default 120) */
++	int every = 120;
++	(void)PE_parse_boot_argn("sweetsamplesec", &every, sizeof(every));
++	if (every < 5 || every > 600) {
++		every = 120;
++	}
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 45 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", every * hz);
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 4f5d65a..21424f6 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -21,6 +21,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/crc.h>
++#include <libkern/libkern.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
+ 
+@@ -226,6 +227,11 @@ static const struct fw_file fw_files_topaz[] = {
+ static const struct fw_file *fw_files = fw_files_topaz;
+ static unsigned fw_files_n = sizeof(fw_files_topaz) / sizeof(fw_files_topaz[0]);
+ 
++static bool fw_runtime;                 /* vayu: tables read from the partition's FAT at boot (fw_scan_partition) */
++static int fw_all_find(const char *path);
++static bool fw_all_read(int i, uint64_t off, void *dst, uint64_t n);
++static int64_t fw_all_size(const char *path);
++
+ static int
+ fw_find(const char *name)
+ {
+@@ -240,6 +246,11 @@ fw_find(const char *name)
+ static int64_t
+ fw_size(const char *name)
+ {
++	if (fw_runtime) {
++		char path[64];
++		snprintf(path, sizeof(path), "image/%s", name);
++		return fw_all_size(path);
++	}
+ 	int i = fw_find(name);
+ 	return i < 0 ? -1 : (int64_t)fw_files[i].size;
+ }
+@@ -248,6 +259,17 @@ fw_size(const char *name)
+ static int64_t
+ fw_read(const char *name, void *dst, uint64_t max)
+ {
++	if (fw_runtime) {
++		char path[64];
++		snprintf(path, sizeof(path), "image/%s", name);
++		int k = fw_all_find(path);
++		int64_t sz = fw_all_size(path);
++		if (k < 0 || sz < 0 || (uint64_t)sz > max || !fw_all_read(k, 0, dst, (uint64_t)sz)) {
++			LOG("%s: not on %s or unreadable (%lld bytes)", name, fw_part, sz);
++			return -1;
++		}
++		return sz;
++	}
+ 	int i = fw_find(name), err;
+ 
+ 	if (i < 0 || fw_files[i].size > max) {
+@@ -2408,6 +2430,214 @@ fw_all_read(int i, uint64_t off, void *dst, uint64_t n)
+ 	return done == n;
+ }
+ 
++static int64_t
++fw_all_size(const char *path)
++{
++	int i = fw_all_find(path);
++	return i < 0 ? -1 : (int64_t)fw_all[i].size;
++}
++
++/*
++ * vayu: where every file of the modem partition lies, read from its FAT16 at boot (as
++ * tools/fwtable.py does on the host), so the phone's own NON-HLOS is used whatever its version.
++ * 1014 boot: the phone's modem partition is not MIUI V14.0.3.0 (modem.mdt crc 9d61fa6d,
++ * "bad ELF header" from the built-in table). Names lowercase (tftp_map lowercases requests).
++ */
++struct fat_scan {
++	uint32_t bps, csize, data_off, nent, nfiles, nx, cap_f, cap_x, names_used;
++	const uint8_t *fat;
++	struct fw_entry *files;
++	struct fw_extent *x;
++	char *names;
++};
++#define FAT_NAMES   (128u << 10)
++
++static uint32_t fat_next(struct fat_scan *f, uint32_t cl) { return *(const uint16_t *)(f->fat + 2u * cl); }
++
++static unsigned
++fat_chain(struct fat_scan *f, uint32_t cl, uint32_t *out, unsigned max)
++{
++	unsigned n = 0;
++	while (cl >= 2 && cl < 0xFFF8u && cl < f->nent && n < max) {
++		out[n++] = cl;
++		cl = fat_next(f, cl);
++	}
++	return n;
++}
++
++static bool
++fat_add_file(struct fat_scan *f, const char *path, uint32_t cl, uint32_t size)
++{
++	size_t pl = strlen(path) + 1;
++	if (f->nfiles == f->cap_f || f->names_used + pl > FAT_NAMES) {
++		return false;
++	}
++	uint32_t first = f->nx, left = size;
++	while (left > 0 && cl >= 2 && cl < 0xFFF8u && cl < f->nent) {
++		uint32_t off = f->data_off + (cl - 2) * f->csize, n = MIN(f->csize, left);
++		if (f->nx > first && f->x[f->nx - 1].off + f->x[f->nx - 1].len == off) {
++			f->x[f->nx - 1].len += n;
++		} else {
++			if (f->nx == f->cap_x) {
++				return false;
++			}
++			f->x[f->nx].off = off;
++			f->x[f->nx].len = n;
++			f->nx++;
++		}
++		left -= n;
++		cl = fat_next(f, cl);
++	}
++	char *nm = f->names + f->names_used;
++	memcpy(nm, path, pl);
++	f->names_used += pl;
++	f->files[f->nfiles].path = nm;
++	f->files[f->nfiles].size = size - left;
++	f->files[f->nfiles].ext = (uint16_t)first;
++	f->files[f->nfiles].next = (uint16_t)(f->nx - first);
++	f->nfiles++;
++	return true;
++}
++
++static void
++fat_walk(struct fat_scan *f, const uint8_t *raw, uint32_t len, const char *prefix, int depth)
++{
++	char lfn[160];
++	bool have_lfn = false;
++	bzero(lfn, sizeof(lfn));
++	for (uint32_t i = 0; i + 32 <= len; i += 32) {
++		const uint8_t *e = raw + i;
++		if (e[0] == 0) {
++			break;
++		}
++		if (e[0] == 0xE5) {
++			have_lfn = false;
++			continue;
++		}
++		uint8_t attr = e[11];
++		if (attr == 0x0F) {
++			unsigned seq = (e[0] & 0x1Fu);
++			static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
++			if (e[0] & 0x40) {
++				bzero(lfn, sizeof(lfn));
++			}
++			for (unsigned k = 0; k < 13 && seq >= 1 && (seq - 1) * 13 + k < sizeof(lfn) - 1; k++) {
++				uint16_t ch = (uint16_t)(e[pos[k]] | (e[pos[k] + 1] << 8));
++				char c = (ch == 0 || ch == 0xFFFF) ? 0 : (ch < 0x80 ? (char)ch : '_');
++				lfn[(seq - 1) * 13 + k] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
++			}
++			have_lfn = true;
++			continue;
++		}
++		if (attr & 0x08) {
++			have_lfn = false;
++			continue;
++		}
++		char name[160];
++		if (have_lfn && lfn[0]) {
++			strlcpy(name, lfn, sizeof(name));
++		} else {
++			unsigned k = 0;
++			for (unsigned j = 0; j < 8 && e[j] != ' '; j++) {
++				name[k++] = (e[j] >= 'A' && e[j] <= 'Z') ? (char)(e[j] - 'A' + 'a') : (char)e[j];
++			}
++			if (e[8] != ' ') {
++				name[k++] = '.';
++				for (unsigned j = 8; j < 11 && e[j] != ' '; j++) {
++					name[k++] = (e[j] >= 'A' && e[j] <= 'Z') ? (char)(e[j] - 'A' + 'a') : (char)e[j];
++				}
++			}
++			name[k] = 0;
++		}
++		have_lfn = false;
++		bzero(lfn, sizeof(lfn));
++		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
++			continue;
++		}
++		uint32_t cl = (uint32_t)(e[26] | (e[27] << 8)), size;
++		memcpy(&size, e + 28, 4);
++		char path[160];
++		snprintf(path, sizeof(path), "%s%s", prefix, name);
++		if (attr & 0x10) {
++			if (depth >= 7) {
++				continue;
++			}
++			uint32_t chain[32];
++			unsigned n = fat_chain(f, cl, chain, 32);
++			uint32_t dlen = n * f->csize;
++			uint8_t *d = n ? (uint8_t *)IOMalloc(dlen) : NULL;
++			bool ok = d != NULL;
++			for (unsigned k = 0; ok && k < n; k++) {
++				ok = sweet_ufs_read_part(fw_part, f->data_off + (chain[k] - 2) * f->csize, d + k * f->csize, f->csize) == 0;
++			}
++			if (ok) {
++				char sub[160];
++				snprintf(sub, sizeof(sub), "%s/", path);
++				fat_walk(f, d, dlen, sub, depth + 1);
++			}
++			if (d != NULL) {
++				IOFree(d, dlen);
++			}
++		} else if (!fat_add_file(f, path, cl, size)) {
++			LOG("fat: table full at %s", path);
++			return;
++		}
++	}
++}
++
++static bool
++fw_scan_partition(void)
++{
++	uint8_t bs[512];
++	if (sweet_ufs_read_part(fw_part, 0, bs, sizeof(bs)) != 0 || bs[510] != 0x55 || bs[511] != 0xAA) {
++		LOG("fat: %s has no boot sector", fw_part);
++		return false;
++	}
++	uint32_t bps = (uint32_t)(bs[11] | (bs[12] << 8)), spc = bs[13], rsv = (uint32_t)(bs[14] | (bs[15] << 8));
++	uint32_t nfat = bs[16], nroot = (uint32_t)(bs[17] | (bs[18] << 8)), spf = (uint32_t)(bs[22] | (bs[23] << 8));
++	if (bps < 512 || bps > 4096 || (bps & (bps - 1)) || spc == 0 || nfat == 0 || nroot == 0 || spf == 0 || spf * bps > (1u << 20)) {
++		LOG("fat: %s is no FAT16 (bps %u spc %u fats %u root %u spf %u)", fw_part, bps, spc, nfat, nroot, spf);
++		return false;
++	}
++	static struct fat_scan f;
++	bzero(&f, sizeof(f));
++	f.bps = bps;
++	f.csize = bps * spc;
++	uint32_t fat_off = rsv * bps, root_off = fat_off + nfat * spf * bps, root_len = nroot * 32;
++	f.data_off = root_off + ((root_len + bps - 1) / bps) * bps;
++	f.nent = spf * bps / 2;
++	f.cap_f = 2048;
++	f.cap_x = 8192;
++	uint8_t *fat = (uint8_t *)IOMalloc(spf * bps), *root = (uint8_t *)IOMalloc(root_len);
++	f.files = (struct fw_entry *)IOMalloc(f.cap_f * sizeof(struct fw_entry));
++	f.x = (struct fw_extent *)IOMalloc(f.cap_x * sizeof(struct fw_extent));
++	f.names = (char *)IOMalloc(FAT_NAMES);
++	bool ok = fat && root && f.files && f.x && f.names &&
++	    sweet_ufs_read_part(fw_part, fat_off, fat, spf * bps) == 0 &&
++	    sweet_ufs_read_part(fw_part, root_off, root, root_len) == 0;
++	if (ok) {
++		f.fat = fat;
++		fat_walk(&f, root, root_len, "", 0);
++		ok = f.nfiles > 0;
++	}
++	if (root != NULL) {
++		IOFree(root, root_len);
++	}
++	/* the FAT, the tables and the names stay: TopazModem reads from them all session */
++	if (!ok) {
++		LOG("fat: scan of %s failed", fw_part);
++		return false;
++	}
++	fw_all = f.files;
++	fw_all_n = f.nfiles;
++	fw_ext = f.x;
++	fw_runtime = true;
++	int m = fw_all_find("image/modem.mdt"), w = fw_all_find("image/wlanmdsp.mbn");
++	LOG("fat: %s: %u files, %u extents (cluster %u bytes); modem.mdt %lld bytes, wlanmdsp.mbn %lld bytes", fw_part,
++	    f.nfiles, f.nx, f.csize, m >= 0 ? (long long)fw_all[m].size : -1LL, w >= 0 ? (long long)fw_all[w].size : -1LL);
++	return true;
++}
++
+ /* QMI */
+ struct qmsg { uint8_t b[512]; uint32_t n; };
+ 
+@@ -6303,7 +6533,7 @@ topaz_soc_map(void)
+ 	uint8_t probe[16];
+ 	int err = EAGAIN;
+ 	for (int i = 0; i < 120 && err == EAGAIN; i++) {
+-		err = sweet_ufs_read_part(fw_part, fw_files[0].off, probe, sizeof(probe));
++		err = sweet_ufs_read_part(fw_part, 0, probe, sizeof(probe));
+ 		if (err == EAGAIN) {
+ 			IOSleep(500);
+ 		}
+@@ -6320,6 +6550,13 @@ topaz_soc_map(void)
+ 		smem = (uint8_t *)smem_map->getVirtualAddress();
+ 		pool = (uint8_t *)pool_map->getVirtualAddress();
+ 		state = 1;
++		if (sweet_soc_vayu()) {
++			uint32_t scan = 1;                  /* vayufwscan=0: the built-in V14.0.3.0 table */
++			(void)PE_parse_boot_argn("vayufwscan", &scan, sizeof(scan));
++			if (scan) {
++				(void)fw_scan_partition();
++			}
++		}
+ 	}
+ 	IOLockUnlock(once);
+ 	return state > 0;
+-- 
+2.53.0
+

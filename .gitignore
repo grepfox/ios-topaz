@@ -14,3 +14,4 @@ userland/out/
 userland/obj/
 userland/mesa/build-mesa/
 userland/mesa/mesa
+userland/out-ci/

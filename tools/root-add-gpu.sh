@@ -18,7 +18,7 @@ gpu=$(realpath "${2:?usage: root-add-gpu.sh ROOT_IMG GPU_DIR}")
 for f in topaz/lib/libOSMesa.8.dylib topaz/lib/libtopaz-gl.dylib topaz/lib/libtopaz-inject.dylib usr/libexec/backboardd SHA256SUMS; do
 	[ -e "$gpu/$f" ] || { echo "missing $gpu/$f" >&2; exit 1; }
 done
-(cd "$gpu" && shasum -a 256 -c --quiet SHA256SUMS 2>/dev/null || sha256sum -c --quiet SHA256SUMS)
+(cd "$gpu" && grep -v " ./SHA256SUMS$" SHA256SUMS | sha256sum -c --quiet)
 mnt=$(mktemp -d)
 sudo mount -t hfsplus -o loop,force "$img" "$mnt"
 trap 'sudo umount "$mnt"; rmdir "$mnt"' EXIT

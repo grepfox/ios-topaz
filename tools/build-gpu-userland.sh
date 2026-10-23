@@ -43,5 +43,5 @@ cp "$M/libOSMesa.8.dylib" "$OUT/topaz/lib/"
 for f in "$OUT/topaz/lib/"*.dylib "$OUT/usr/libexec/backboardd"; do
 	codesign -f -s - "$f"
 done
-(cd "$OUT" && find . -type f | sort | xargs shasum -a 256 > SHA256SUMS)
+(cd "$OUT" && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS)
 cat "$OUT/SHA256SUMS"

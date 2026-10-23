@@ -1,0 +1,148 @@
+From 28b8815ffc91bafdb86212e3850e3efc43a8e8ab Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 20:49:48 +0200
+Subject: [PATCH] vayu-0192: panel copy reads the GPU pool through a cached
+ view (DC IVAC first; vayupoolcache=0 off); sweetfb_vsync rate published to
+ CoreAnimation; vsync lock follows the panel every frame at 120
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 20 +++++++++--
+ iokit/Kernel/arm/TopazAdreno.cpp      | 49 +++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 31a2024..91d0197 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,8 @@ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBus
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ extern "C" void topaz_adreno_init(void);           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
++extern "C" uint8_t *topaz_gpu_pool_cached(uint64_t pa, uint64_t size);       /* TopazAdreno.cpp */
++extern "C" void topaz_gpu_pool_invalidate(const uint8_t *va, uint64_t size);
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -168,6 +170,7 @@ enum {
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ /* vsync period; boot-arg sweetfb_vsync (Hz, 30..120, default 60) */
+ static uint32_t sweet_fb_vsync_us = 16667;
++static uint32_t sweet_fb_vhz = 60;     /* the rate published to CoreAnimation (sweetfb_vsync=) */
+ #define SWEET_FB_VSYNC_US               sweet_fb_vsync_us
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+@@ -573,6 +576,7 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t vhz = 60;
+ 	if (PE_parse_boot_argn("sweetfb_vsync", &vhz, sizeof(vhz)) && vhz >= 30 && vhz <= 120) {
+ 		sweet_fb_vsync_us = 1000000u / vhz;
++		sweet_fb_vhz = vhz;
+ 	} else {
+ 		vhz = 60;
+ 	}
+@@ -765,7 +769,8 @@ AppleCLCD::vsyncNext(void)
+ 	}
+ 	uint32_t left = (uint32_t)((uint64_t)(fVTotal - line) * fPanelUS / fVTotal);
+ 	uint32_t next = left + 300;
+-	while (next < 12000) {
++	/* the panel frame after next at 60 Hz, the next one at 120 (sweetfb_vsync=120) */
++	while (next < sweet_fb_vsync_us * 3 / 4) {
+ 		next += fPanelUS;
+ 	}
+ 	return next;
+@@ -800,7 +805,7 @@ AppleCLCD::publishModes(void)
+ 	OSDictionary *color = OSDictionary::withCapacity(8);
+ 	OSArray *timings = OSArray::withCapacity(1);
+ 	OSArray *colors = OSArray::withCapacity(1);
+-	const uint32_t rate = 60u << 16;        /* 16.16 */
++	const uint32_t rate = sweet_fb_vhz << 16;      /* 16.16; sweetfb_vsync=120: CoreAnimation at 120 */
+ 
+ 	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
+ 		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
+@@ -830,7 +835,7 @@ AppleCLCD::publishModes(void)
+ 		timings->setObject(timing);
+ 		setProperty("TimingElements", timings);
+ 		setProperty("ColorElements", colors);
+-		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++		IOLog("SWEET FB: modes published: %ux%u at %u Hz\n", fLogicalW, fLogicalH, sweet_fb_vhz);
+ 	}
+ 	OSSafeReleaseNULL(timings);
+ 	OSSafeReleaseNULL(colors);
+@@ -1601,6 +1606,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (src != 0 && bpe == 4 && s->gpuPool && s->scanoutPhys != 0 && sweet_soc_vayu()) {
++			/* read the GPU's picture through the pool's cached view (vayupoolcache=0: as before) */
++			uint64_t first = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow;
++			uint8_t *c = topaz_gpu_pool_cached(s->scanoutPhys, s->memory->getLength());
++			if (c != NULL) {
++				topaz_gpu_pool_invalidate(c + first, last - first);
++				src = (uintptr_t)c;
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 1cfadf4..db126a3 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -253,6 +253,55 @@ topaz_gpu_pool_md(uint64_t pa, uint64_t size)
+ 	           kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
+ }
+ 
++/*
++ * A cached kernel view of the whole pool, for reading what the GPU drew with the CPU (vayu's
++ * panel copy). The pool's own mappings are write-combined, and reading 11 MB of a frame from
++ * there took 8.3 ms (1011 log). Nothing is written through this view, so it holds no dirty
++ * lines: invalidate the range (topaz_gpu_pool_invalidate) after the GPU is done, then read.
++ * Made on first use; NULL if the pool is not set up or the mapping failed. vayupoolcache=0: off.
++ */
++#ifndef VM_WIMG_DEFAULT
++#define VM_WIMG_DEFAULT 0x2      /* osfmk/arm/memory_types.h: write-back cacheable */
++#endif
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern "C" uint8_t *topaz_gpu_pool_cached(uint64_t pa, uint64_t size);
++uint8_t *
++topaz_gpu_pool_cached(uint64_t pa, uint64_t size)
++{
++	static vm_offset_t base;
++	static int state;               /* 0 untried, 1 mapped, -1 off */
++
++	if (state == 0) {
++		uint32_t on = 1;
++		(void)PE_parse_boot_argn("vayupoolcache", &on, sizeof(on));
++		state = -1;
++		if (on && gpu_pool_base != 0 && gpu_pool_size != 0) {
++			base = ml_io_map_unmappable((vm_offset_t)gpu_pool_base, (vm_size_t)gpu_pool_size, VM_WIMG_DEFAULT);
++			state = base != 0 ? 1 : -1;
++			IOLog("TopazGPU: cached view of the pool %s (%#llx + %llu MB)\n", base ? "made" : "NOT made",
++			    gpu_pool_base, gpu_pool_size >> 20);
++		}
++	}
++	if (state != 1 || pa < gpu_pool_base || pa + size > gpu_pool_base + gpu_pool_size) {
++		return NULL;
++	}
++	return (uint8_t *)(base + (pa - gpu_pool_base));
++}
++
++/* drop this view's lines of [va, va + size) (DC IVAC: they are never dirty) */
++extern "C" void topaz_gpu_pool_invalidate(const uint8_t *va, uint64_t size);
++void
++topaz_gpu_pool_invalidate(const uint8_t *va, uint64_t size)
++{
++	uintptr_t a = (uintptr_t)va & ~(uintptr_t)63, end = (uintptr_t)va + size;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; a < end; a += 64) {
++		__asm__ volatile ("dc ivac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /* boot-arg gpu_midmem=1: the ADT gives the kernel RAM below 4 GiB (mkadt.py --midmem), GPU memory is the kernel's */
+ static uint32_t gpu_midmem;
+ extern "C" bool topaz_gpu_midmem(void);
+-- 
+2.53.0
+

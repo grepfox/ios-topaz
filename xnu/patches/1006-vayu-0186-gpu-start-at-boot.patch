@@ -1,0 +1,35 @@
+From f481a2a5291e8dbf6f6b73983b619cabc78317de Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 15:34:25 +0200
+Subject: [PATCH] vayu-0186: GPU vayugpu=5 starts at boot (the injector waits
+ only 5 s for RedwoodGPU); vayugpudelay=
+
+---
+ bsd/dev/vayu_gpu.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 2f6ec63..63ff7d7 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -117,7 +117,16 @@ vg_dump(const char *when)
+ static void
+ vg_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+-	delay_for_interval(60, NSEC_PER_SEC);
++	/*
++	 * Tests (vayugpu 1-4) wait 60 s so a hang comes after the GUI. vayugpu=5
++	 * starts at once: libtopaz-inject waits only 5 s in backboardd for
++	 * RedwoodGPU. Boot-arg vayugpudelay=SECONDS overrides.
++	 */
++	int wait_s = vg_level >= 5 ? 0 : 60;
++	(void)PE_parse_boot_argn("vayugpudelay", &wait_s, sizeof(wait_s));
++	if (wait_s > 0) {
++		delay_for_interval((uint32_t)wait_s, NSEC_PER_SEC);
++	}
+ 	vg_gcc = ml_io_map(VG_GCC_PA, VG_GCC_SIZE);
+ 	vg_gpu = ml_io_map(VG_GPU_PA, VG_GPU_SIZE);
+ 	if (!vg_gcc || !vg_gpu) {
+-- 
+2.53.0
+

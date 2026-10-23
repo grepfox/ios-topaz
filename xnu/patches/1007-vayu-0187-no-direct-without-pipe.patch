@@ -1,0 +1,32 @@
+From 883bf7d7d9e3ce8b6d48ebf36e79e1874318c7e7 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 18:02:12 +0200
+Subject: [PATCH] vayu-0187: direct (GPU pool) frames only with a direct
+ scanout pipe; vayu's CPU-copy display has fVig0/fCtl0 NULL (gpu=1 panicked in
+ showDirect)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f70787f..ab20f3b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -968,7 +968,12 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
++	/*
++	 * vayu scans out of the boot framebuffer by CPU copy (no direct pipe: fVig0 / fCtl0 NULL
++	 * unless sweetscan=1). 1006 boot with gpu=1: showDirect read fCtl0 -> kernel data abort.
++	 */
++	return fVig0 != NULL && fCtl0 != NULL &&
++	    layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
+ }
+ 
+ void
+-- 
+2.53.0
+

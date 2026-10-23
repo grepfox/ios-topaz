@@ -1,0 +1,94 @@
+From 2189eec3f1129ed05ca39d80eeb1d960c2737f27 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:05:57 +0200
+Subject: [PATCH] vayu: SMEM cached-list lookup (modem GLINK FIFO 480)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 57 +++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index fae534e..161abcf 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -309,6 +309,55 @@ smem_partition(uint16_t a, uint16_t b)
+ 	return NULL;
+ }
+ 
++/* the partition's cache line from the TOC (qcom_smem: entry->cacheline), 64 if not given */
++static uint32_t
++smem_cacheline(struct smem_part_hdr *p)
++{
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++
++	if (memcmp(pt->magic, "$TOC", 4) == 0 && pt->num_entries <= 64) {
++		for (uint32_t i = 0; i < pt->num_entries; i++) {
++			if (smem + e[i].offset == (uint8_t *)p && e[i].cacheline >= 8 && e[i].cacheline <= 4096 &&
++			    (e[i].cacheline & (e[i].cacheline - 1)) == 0) {
++				return e[i].cacheline;
++			}
++		}
++	}
++	return 64;
++}
++
++/*
++ * qcom_smem_get_private()'s second list: cached entries grow down from the partition's end,
++ * each header (aligned to the cache line) after its data. vayu 1016: the SM8150 modem wrote
++ * its GLINK replies (rx head 0x58 and rising) into a FIFO 480 the uncached walk never found.
++ */
++static void *
++smem_get_cached(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
++{
++	uint32_t cl = smem_cacheline(p), hsz = (sizeof(struct smem_priv_entry) + cl - 1) & ~(cl - 1);
++	uint8_t *base = (uint8_t *)p, *end = base + p->free_cached;
++
++	if (p->free_cached > p->size || p->size < hsz) {
++		return NULL;
++	}
++	uint8_t *e = base + p->size - hsz;
++	for (int n = 0; n < 512 && e > end && e >= base + sizeof(*p); n++) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5 || h->size > (uint32_t)(e - base)) {
++			return NULL;
++		}
++		if (h->item == item) {
++			if (size != NULL) {
++				*size = h->size - h->pad_data;
++			}
++			return e - h->size;
++		}
++		e -= h->size + hsz;
++	}
++	return NULL;
++}
++
+ static void *
+ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ {
+@@ -317,6 +366,10 @@ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ 	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size) {
+ 		return NULL;
+ 	}
++	void *c = smem_get_cached(p, item, size);
++	if (c != NULL) {
++		return c;
++	}
+ 	e = (uint8_t *)p + sizeof(*p);
+ 	end = (uint8_t *)p + p->free_uncached;
+ 	while (e + sizeof(struct smem_priv_entry) <= end) {
+@@ -1034,6 +1087,10 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 			tries++;
+ 			uint32_t sz = 0;
+ 			void *f480 = smem_get(part, SMEM_GLINK_FIFO_RX, &sz);
++			if (tries == 1) {
++				LOG("glink: partition size %x free_uncached %x free_cached %x cacheline %u", part->size,
++				    part->free_uncached, part->free_cached, smem_cacheline(part));
++			}
+ 			LOG("t=%u ms: glink wait %u: desc %08x %08x %08x %08x, modem FIFO %s (%u), resend VERSION", ms, tries,
+ 			    g_desc ? g_desc[0] : 0, g_desc ? g_desc[1] : 0, g_desc ? g_desc[2] : 0, g_desc ? g_desc[3] : 0,
+ 			    f480 ? "there" : "missing", sz);
+-- 
+2.53.0
+

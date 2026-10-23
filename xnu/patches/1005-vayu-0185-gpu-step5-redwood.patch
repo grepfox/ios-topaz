@@ -1,0 +1,442 @@
+From 9e4337e6b0ede3254f4d46a7820cf247099c7287 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 14:51:06 +0200
+Subject: [PATCH] vayu-0185: GPU step 5 (vayugpu=5): redwood_gpu_* forwarded to
+ the A640 on vayu, identity map of DRAM on the GPU stream, pool 0xb0000000+192
+ MB, IB submit + CACHE_FLUSH_TS fence self test, RedwoodGPU published
+
+---
+ bsd/dev/vayu_gpu.c               | 199 ++++++++++++++++++++++++++++++-
+ iokit/Kernel/arm/TopazAdreno.cpp |  69 ++++++++++-
+ 2 files changed, 259 insertions(+), 9 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 39a6cf4..2f6ec63 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -23,6 +23,7 @@
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
+ #include <arm/caches_internal.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -57,10 +58,14 @@ void vayu_gpu_init(void);
+ #define GMU_REG(w)          ((uint32_t)(w) * 4u)
+ 
+ static vm_offset_t vg_gcc, vg_gpu;
++static int vg_ready;
++static lck_mtx_t *vg_lock;
+ static int vg_level;            /* boot-arg vayugpu: 1 power + reads, 2 + GMU boot */
+ static bool vg_step2(void);
+ static bool vg_step3(void);
+ static bool vg_step4(void);
++extern void vayu_redwood_start(void);      /* iokit/Kernel/arm/TopazAdreno.cpp */
++static void vg_step5(void);
+ extern int sweet_cmddb_aux(const char *res, void *buf, unsigned max);   /* bsd/dev/sweet_rpmh.c */
+ 
+ static uint32_t
+@@ -187,6 +192,9 @@ vg_thread(__unused void *arg, __unused wait_result_t wr_)
+ 				bool cp = vg_step4();
+ 				printf("VAYU GPU: step 4 %s\n", cp ? "done: GPU runs commands" : "FAILED");
+ 				sweet_log_flush_now();
++				if (cp && vg_level >= 5) {
++					vg_step5();
++				}
+ 			}
+ 		}
+ 	}
+@@ -862,6 +870,7 @@ vg_step3(void)
+ #define M_GL2           0xA1000u
+ #define M_GL3A          0xA2000u        /* the 2 MB window(s) holding the GPU buffer */
+ #define M_GL3B          0xA3000u
++#define M_GL2ID         0xA8000u        /* step 5: 6 L2 tables, DRAM 0x80000000..0x200000000 in 2 MB blocks */
+ /*
+  * GPU buffer (256 KB, page aligned, mapped page by page with IOVA = PA):
+  * SQE, ring, scratch. 1001 boot: a 2 MB physically aligned kmem_alloc_contig
+@@ -871,6 +880,7 @@ vg_step3(void)
+ #define G_SQE           0x00000u
+ #define G_RING          0x10000u
+ #define G_MEM           0x20000u
++#define G_FENCE         0x20100u        /* CACHE_FLUSH_TS target (step 5) */
+ #define RB_BYTES        0x8000u
+ #define RB_DWORDS       (RB_BYTES / 4)
+ 
+@@ -1032,12 +1042,29 @@ vg_smmu_gpu(void)
+ 		printf("VAYU GPU: GPU buffer crosses 1 GB\n");
+ 		return false;
+ 	}
+-	l1[(first >> 30) & 511] = (vg_mem_pa + M_GL2) | 3u;
+-	l2[(first >> 21) & 511] = (vg_mem_pa + M_GL3A) | 3u;
+-	l2[(last >> 21) & 511] = (vg_mem_pa + (last == first ? M_GL3A : M_GL3B)) | 3u;
+-	for (uint64_t pa = vg_g_pa; pa < vg_g_pa + G_SIZE; pa += 0x1000) {
+-		volatile uint64_t *l3 = (pa & ~0x1fffffull) == first ? l3a : l3b;
+-		l3[(pa >> 12) & 511] = pa | (1u << 10) | (3u << 8) | (1u << 6) | 3u;    /* page, AP RW any */
++	if (vg_level >= 5) {
++		/*
++		 * Step 5: RedwoodGPU runs identity (GPU VA = PA, gpu_identity like
++		 * topaz): every buffer Mesa or SweetSurface hands over is pool or
++		 * kernel RAM, so the GPU stream maps all of DRAM 1:1 in 2 MB blocks.
++		 */
++		for (unsigned g = 2; g < 8; g++) {
++			volatile uint64_t *t = (volatile uint64_t *)(vg_mem + M_GL2ID + 0x1000u * (g - 2));
++			for (unsigned i = 0; i < 512; i++) {
++				uint64_t pa = ((uint64_t)g << 30) | ((uint64_t)i << 21);
++				t[i] = pa | (1u << 10) | (3u << 8) | (1u << 6) | 1u;      /* block, AP RW any */
++			}
++			l1[g] = (vg_mem_pa + M_GL2ID + 0x1000u * (g - 2)) | 3u;
++		}
++		flush_dcache64((addr64_t)(vg_mem_pa + M_GL2ID), 0x6000, TRUE);
++	} else {
++		l1[(first >> 30) & 511] = (vg_mem_pa + M_GL2) | 3u;
++		l2[(first >> 21) & 511] = (vg_mem_pa + M_GL3A) | 3u;
++		l2[(last >> 21) & 511] = (vg_mem_pa + (last == first ? M_GL3A : M_GL3B)) | 3u;
++		for (uint64_t pa = vg_g_pa; pa < vg_g_pa + G_SIZE; pa += 0x1000) {
++			volatile uint64_t *l3 = (pa & ~0x1fffffull) == first ? l3a : l3b;
++			l3[(pa >> 12) & 511] = pa | (1u << 10) | (3u << 8) | (1u << 6) | 3u;    /* page, AP RW any */
++		}
+ 	}
+ 	flush_dcache64((addr64_t)(vg_mem_pa + M_GL1), 0x4000, TRUE);
+ 	wr(cbp, 0x0, 0);
+@@ -1267,4 +1294,164 @@ vg_step4(void)
+ 	    *flag, gpu_r(0x210), rd(vg_cbg, 0x58));
+ 	return idle && *flag == 0xC0FFEE64u;
+ }
++/*
++ * ---- step 5: what RedwoodGPU.cpp needs (TopazAdreno.cpp forwards its
++ * redwood_gpu_* calls here on vayu) ----
++ */
++static uint32_t vg_seqno;
++
++int vayu_gpu_ready(void);
++int
++vayu_gpu_ready(void)
++{
++	return vg_ready;
++}
++
++/* Mesa's MSM_PARAM_* answers for the A640 (KGSL adreno-gpulist / a6xx_calc_ubwc_config) */
++int vayu_gpu_parameter(uint32_t which, uint64_t *value);
++int
++vayu_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01: *value = 640; return 1;                      /* GPU_ID */
++	case 0x02: *value = 0x100000; return 1;                 /* GMEM_SIZE: 1 MB */
++	case 0x03: *value = 0x06040001; return 1;               /* CHIP_ID */
++	case 0x04: *value = 257000000ull; return 1;             /* MAX_FREQ: the voted level */
++	case 0x05:                                              /* TIMESTAMP: CP always-on counter */
++		*value = vg_ready ? ((uint64_t)gpu_r(0x981) << 32 | gpu_r(0x980)) : 0;
++		return 1;
++	case 0x06: *value = 0x100000; return 1;                 /* GMEM_BASE */
++	case 0x07: *value = 1; return 1;                        /* PRIORITIES */
++	case 0x08: case 0x09: case 0x0a: case 0x11:
++		*value = 0;
++		return 1;
++	case 0x10: *value = 15; return 1;                       /* HIGHEST_BANK_BIT (DT) */
++	case 0x12: *value = 6; return 1;                        /* UBWC_SWIZZLE (a640) */
++	case 0x13: *value = 0; return 1;                        /* MACROTILE_MODE */
++	default:
++		return 0;
++	}
++}
++
++static uint32_t
++vg_ring_free(void)
++{
++	uint32_t r = gpu_r(0x806), w = vg_wptr % RB_DWORDS;
++	return (r + RB_DWORDS - w - 1) % RB_DWORDS;
++}
++
++/* IBs, then CACHE_FLUSH_TS writing the submission number to the fence word. 0: ring full / not ready. */
++uint32_t vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++uint32_t
++vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	uint32_t need = 4 * count + 5;
++	if (!vg_ready) {
++		return 0;
++	}
++	lck_mtx_lock(vg_lock);
++	for (int spin = 0; vg_ring_free() < need && spin < 20000; spin++) {
++		delay(100);
++	}
++	if (vg_ring_free() < need) {
++		lck_mtx_unlock(vg_lock);
++		return 0;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		vg_emit(vg_pkt7(0x3f, 3));                      /* CP_INDIRECT_BUFFER */
++		vg_emit((uint32_t)addresses[i]);
++		vg_emit((uint32_t)(addresses[i] >> 32));
++		vg_emit(words[i]);
++	}
++	if (++vg_seqno == 0) {
++		vg_seqno = 1;
++	}
++	uint32_t fence = vg_seqno;
++	vg_emit(vg_pkt7(0x46, 4));                              /* CP_EVENT_WRITE */
++	vg_emit(4);                                             /* CACHE_FLUSH_TS */
++	vg_emit((uint32_t)(vg_g_pa + G_FENCE));
++	vg_emit((uint32_t)((vg_g_pa + G_FENCE) >> 32));
++	vg_emit(fence);
++	flush_dcache64((addr64_t)(vg_g_pa + G_RING), RB_BYTES, TRUE);
++	gpu_w(0x807, vg_wptr % RB_DWORDS);
++	lck_mtx_unlock(vg_lock);
++	return fence;
++}
++
++int vayu_gpu_done(uint32_t fence);
++int
++vayu_gpu_done(uint32_t fence)
++{
++	if (!vg_g) {
++		return 0;
++	}
++	flush_dcache64((addr64_t)(vg_g_pa + G_FENCE), 64, TRUE);
++	return (int32_t)(*(volatile uint32_t *)(vg_g + G_FENCE) - fence) >= 0;
++}
++
++uint32_t vayu_gpu_last(void);
++uint32_t
++vayu_gpu_last(void)
++{
++	return vg_seqno;
++}
++
++void vayu_gpu_report(const char *why);
++void
++vayu_gpu_report(const char *why)
++{
++	uint64_t ib1 = gpu_r(0x928) | ((uint64_t)gpu_r(0x929) << 32);
++	flush_dcache64((addr64_t)(vg_g_pa + G_FENCE), 64, TRUE);
++	printf("VAYU GPU: %s: fence %u done %u rptr %u wptr %u RBBM_STATUS %#x CP_HW_FAULT %#x IB1 %#llx rem %u, GPU SMMU FSR %#x FAR %#x%08x\n",
++	    why, vg_seqno, *(volatile uint32_t *)(vg_g + G_FENCE), gpu_r(0x806), vg_wptr % RB_DWORDS,
++	    gpu_r(0x210), gpu_r(0x821), ib1, gpu_r(0x92A), vg_cbg ? rd(vg_cbg, 0x58) : 0u,
++	    vg_cbg ? rd(vg_cbg, 0x64) : 0u, vg_cbg ? rd(vg_cbg, 0x60) : 0u);
++}
++
++static void
++vg_step5(void)
++{
++	vg_lock = lck_mtx_alloc_init(lck_grp_alloc_init("vayu_gpu", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
++	*(volatile uint32_t *)(vg_g + G_FENCE) = 0;
++	flush_dcache64((addr64_t)(vg_g_pa + G_FENCE), 64, TRUE);
++	vg_ready = 1;
++	/* self test of the submit path Mesa uses: one IB (CP_MEM_WRITE) + CACHE_FLUSH_TS fence */
++	volatile uint32_t *ib = (volatile uint32_t *)(vg_g + G_MEM + 0x400);
++	volatile uint32_t *flag = (volatile uint32_t *)(vg_g + G_MEM + 0x40);
++	*flag = 0;
++	ib[0] = vg_pkt7(0x3d, 3);
++	ib[1] = (uint32_t)(vg_g_pa + G_MEM + 0x40);
++	ib[2] = (uint32_t)((vg_g_pa + G_MEM + 0x40) >> 32);
++	ib[3] = 0x5EB0A640u;
++	flush_dcache64((addr64_t)(vg_g_pa + G_MEM), 0x1000, TRUE);
++	uint64_t ib_addr = vg_g_pa + G_MEM + 0x400;
++	uint32_t ib_words = 4;
++	uint32_t fence = vayu_gpu_submit(&ib_addr, &ib_words, 1);
++	int done = 0;
++	for (unsigned i = 0; i < 1000 && fence && !(done = vayu_gpu_done(fence)); i++) {
++		delay(100);
++	}
++	flush_dcache64((addr64_t)(vg_g_pa + G_MEM), 0x1000, TRUE);
++	printf("VAYU GPU: step 5a: IB submit fence %u %s, IB wrote %#x (want 0x5eb0a640)\n", fence,
++	    done ? "signalled" : "NOT signalled", *flag);
++	if (!done || *flag != 0x5EB0A640u) {
++		vayu_gpu_report("step 5a");
++		vg_ready = 0;
++		sweet_log_flush_now();
++		return;
++	}
++	vayu_redwood_start();                   /* iokit/Kernel/arm/TopazAdreno.cpp -> RedwoodGPUStart */
++	printf("VAYU GPU: step 5: Adreno 640 ready, RedwoodGPU published\n");
++	sweet_log_flush_now();
++}
++
++void vayu_gpu_stop(void);
++void
++vayu_gpu_stop(void)
++{
++	if (vg_ready) {
++		gpu_w(0x808, 0);
++	}
++	vg_ready = 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..62bed83 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -33,6 +33,24 @@ int topaz_fw_read(const char *path, void **data, size_t *size);
+ void topaz_fw_free(void *data, size_t size);
+ int topaz_root_mounted(void);
+ void RedwoodGPUStart(void);
++/*
++ * vayu (Adreno 640, bsd/dev/vayu_gpu.c): the redwood_gpu_* calls below go
++ * there; the pool is RAM the kernel was not given there too.
++ */
++extern "C" int sweet_soc_vayu(void);
++extern "C" int vayu_gpu_ready(void);
++extern "C" int vayu_gpu_parameter(uint32_t which, uint64_t *value);
++extern "C" uint32_t vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++extern "C" int vayu_gpu_done(uint32_t fence);
++extern "C" uint32_t vayu_gpu_last(void);
++extern "C" void vayu_gpu_report(const char *why);
++extern "C" void vayu_gpu_stop(void);
++extern "C" void vayu_redwood_start(void);
++void
++vayu_redwood_start(void)
++{
++	RedwoodGPUStart();
++}
+ void topaz_adreno_init(void);
+ extern const uint8_t topaz_fw_zap_mdt[], topaz_fw_zap_b02[], topaz_fw_sqe_fw[];
+ extern const size_t topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size, topaz_fw_sqe_fw_size;
+@@ -159,12 +177,18 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * reserved regions in the stock DT, not given to the kernel): a pool of it is
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
+-#define GPU_POOL_BASE       0x90000000ull
+-#define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
++/*
++ * vayu: 0xb0000000-0xbcc00000 is RAM in ABL's first /memory block above the
++ * last reserved region (ramdump_fb ends at 0xb0000000); the shim gives xnu
++ * only the 0xc0000000 block. 192 MB of it (3 chunks).
++ */
++static uint64_t gpu_pool_base = 0x90000000ull, gpu_pool_size = 0x40000000ull;
++#define GPU_POOL_BASE       gpu_pool_base
++#define GPU_POOL_SIZE       gpu_pool_size       /* topaz 1 GB, vayu 192 MB */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+ #define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
+-static uint8_t *gpu_chunk_va[GPU_POOL_CHUNKS];
++static uint8_t *gpu_chunk_va[0x40000000ull / 0x4000000ull];
+ static bool gpu_pool_ready;
+ static struct { uint64_t start, size; } pool_free[2048];
+ static unsigned pool_free_count;
+@@ -250,6 +274,10 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 		return 0;
+ 	}
+ 	if (!gpu_pool_ready) {
++		if (sweet_soc_vayu()) {
++			gpu_pool_base = 0xb0000000ull;
++			gpu_pool_size = 0x0c000000ull;
++		}
+ 		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+ 		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
+ 			range_free(pool_free, &pool_free_count, 2048, GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
+@@ -787,6 +815,9 @@ extern "C" bool redwood_gpu_identity(void);
+ bool
+ redwood_gpu_identity(void)
+ {
++	if (sweet_soc_vayu()) {
++		return true;
++	}
+ 	return gpu_identity != 0;
+ }
+ 
+@@ -1026,12 +1057,18 @@ hw_start(void)
+ bool
+ redwood_gpu_ready(void)
+ {
++	if (sweet_soc_vayu()) {
++		return vayu_gpu_ready() != 0;
++	}
+ 	return ready;
+ }
+ 
+ bool
+ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ {
++	if (sweet_soc_vayu()) {
++		return vayu_gpu_parameter(which, value) != 0;
++	}
+ 	switch (which) {
+ 	case 0x01: *value = 610; return true;                   /* GPU_ID */
+ 	case 0x02: *value = GMEM_SIZE; return true;             /* GMEM_SIZE */
+@@ -1056,6 +1093,9 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ bool
+ redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ {
++	if (sweet_soc_vayu()) {
++		return true;                    /* identity: all DRAM is mapped */
++	}
+ 	if (gpu_identity) {
+ 		return true;
+ 	}
+@@ -1065,6 +1105,9 @@ redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ void
+ redwood_gpu_mapped(void)
+ {
++	if (sweet_soc_vayu()) {
++		return;
++	}
+ 	if (tables_dirty) {
+ 		tables_dirty = false;
+ 		tlb_flush();
+@@ -1074,6 +1117,9 @@ redwood_gpu_mapped(void)
+ void
+ redwood_gpu_unmap(uint64_t address, uint64_t size)
+ {
++	if (sweet_soc_vayu()) {
++		return;
++	}
+ 	if (gpu_identity) {
+ 		return;
+ 	}
+@@ -1099,6 +1145,9 @@ redwood_gpu_to_memory(void *start, uint64_t size)
+ bool
+ redwood_gpu_done(uint32_t fence)
+ {
++	if (sweet_soc_vayu()) {
++		return vayu_gpu_done(fence) != 0;
++	}
+ 	if (mem.va == NULL) {
+ 		return false;
+ 	}
+@@ -1109,6 +1158,9 @@ redwood_gpu_done(uint32_t fence)
+ uint32_t
+ redwood_gpu_last(void)
+ {
++	if (sweet_soc_vayu()) {
++		return vayu_gpu_last();
++	}
+ 	return seqno;
+ }
+ 
+@@ -1124,6 +1176,9 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
++	if (sweet_soc_vayu()) {
++		return vayu_gpu_submit(addresses, words, count);
++	}
+ 	uint32_t need = 4 * count + 5;
+ 
+ 	if (!ready) {
+@@ -1160,6 +1215,10 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ void
+ redwood_gpu_report(const char *why)
+ {
++	if (sweet_soc_vayu()) {
++		vayu_gpu_report(why);
++		return;
++	}
+ 	uint64_t ib1 = gpu_rd(0x928) | ((uint64_t)gpu_rd(0x929) << 32);
+ 	IOLog("TopazGPU: %s: fence %u done %u rptr %u wptr %u RBBM_STATUS %08x CP_HW_FAULT %08x IB1 %llx rem %u\n", why,
+ 	    seqno, mem.va ? *(volatile uint32_t *)mem.va : 0, gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x210),
+@@ -1170,6 +1229,10 @@ redwood_gpu_report(const char *why)
+ void
+ redwood_gpu_stop(void)
+ {
++	if (sweet_soc_vayu()) {
++		vayu_gpu_stop();
++		return;
++	}
+ 	if (ready) {
+ 		gpu_wr(0x808, 0);
+ 	}
+-- 
+2.53.0
+

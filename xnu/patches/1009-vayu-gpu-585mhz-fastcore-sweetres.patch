@@ -1,0 +1,182 @@
+From 89c83ea7fda160611a5a0ae3a0dae65b864cd7b4 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:14:45 +0200
+Subject: [PATCH] vayu-0189: GPU at 585 MHz (vayugpufreq=1..5), backboardd
+ render/submit threads bound to big cores (fastcore=), sweetres= reserved
+ screen buffers
+
+---
+ bsd/dev/vayu_gpu.c                    | 20 ++++++++++++---
+ iokit/Kernel/arm/RedwoodGPU.cpp       |  2 ++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  2 ++
+ iokit/Kernel/arm/SweetSurface.cpp     |  8 ++++--
+ osfmk/kern/exception.c                | 35 +++++++++++++++++++++++++++
+ 5 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 0af30dd..414020d 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -718,6 +718,13 @@ vg_arc(const char *res, uint16_t *v, unsigned max)
+ 	return n;
+ }
+ 
++/*
++ * GPU OPPs (speed bin 0, gpu_opp_table_v2), ascending. vayugpufreq=1..5 picks the one voted at
++ * start (default 5 = 585 MHz; the 1008 boot at 257 MHz waited 7 ms a frame for the GPU).
++ */
++static const uint32_t gpu_khz[6] = { 0, 257000, 345000, 427000, 499200, 585000 };
++static uint32_t vg_freq_idx = 5;
++
+ /* setup_volt_dependency_tbl: ARC_VOTE_SET(pri index, sec index, vlvl) */
+ static bool
+ vg_votes(uint32_t *votes, const uint16_t *pri, unsigned npri, const uint16_t *sec, unsigned nsec,
+@@ -773,7 +780,6 @@ vg_step3(void)
+ 		return false;
+ 	}
+ 	/* gpu_freqs ascending (KGSL reverses pwrlevels): speed bin 0, gpu_opp_table_v2 levels */
+-	static const uint32_t gpu_khz[6] = { 0, 257000, 345000, 427000, 499200, 585000 };
+ 	static const uint32_t gpu_vlvl[6] = { 0, 64, 128, 192, 224, 256 };
+ 	static const uint32_t gmu_khz[2] = { 0, 200000 };
+ 	static const uint32_t gmu_vlvl[2] = { 0, 48 };     /* gpu_cc_gmu_clk_src 200 MHz at VDD_MIN = MIN_SVS */
+@@ -827,8 +833,14 @@ vg_step3(void)
+ 	 * (collapse cleared, not powered).
+ 	 */
+ 	vm_offset_t cc = vg_gpu + VG_GPUCC;
+-	uint32_t vote[4] = { HFI_CMD(30, 16), 1, 1, 0xFF };     /* blocking ack, freq index 1 = 257 MHz */
+-	int verr = vg_hfi_cmd(vote, ack, 16, "GX_BW_PERF_VOTE 257 MHz");
++	{
++		uint32_t fi = 5;
++		(void)PE_parse_boot_argn("vayugpufreq", &fi, sizeof(fi));
++		vg_freq_idx = (fi >= 1 && fi <= 5) ? fi : 5;
++	}
++	uint32_t vote[4] = { HFI_CMD(30, 16), 1, vg_freq_idx, 0xFF };  /* blocking ack, freq index, bw 0xFF (none) */
++	int verr = vg_hfi_cmd(vote, ack, 16, "GX_BW_PERF_VOTE");
++	printf("VAYU GPU: step 3f: GPU clock vote %u kHz (index %u)\n", gpu_khz[vg_freq_idx], vg_freq_idx);
+ 	printf("VAYU GPU: step 3f: perf vote %d, GX GDSCR %#x; OOB GPU request\n", verr, rd(cc, GPUCC_GX_GDSCR));
+ 	sweet_log_flush_now();
+ 	gmu_wr(0x1F994, 1u << 30);              /* HOST2GMU_INTR_SET: OOB GPU set (HFI branch != 0) */
+@@ -1397,7 +1409,7 @@ vayu_gpu_parameter(uint32_t which, uint64_t *value)
+ 	case 0x01: *value = 640; return 1;                      /* GPU_ID */
+ 	case 0x02: *value = 0x100000; return 1;                 /* GMEM_SIZE: 1 MB */
+ 	case 0x03: *value = 0x06040001; return 1;               /* CHIP_ID */
+-	case 0x04: *value = 257000000ull; return 1;             /* MAX_FREQ: the voted level */
++	case 0x04: *value = (uint64_t)gpu_khz[vg_freq_idx] * 1000ull; return 1;   /* MAX_FREQ: the voted level */
+ 	case 0x05:                                              /* TIMESTAMP: CP always-on counter */
+ 		*value = vg_ready ? ((uint64_t)gpu_r(0x981) << 32 | gpu_r(0x980)) : 0;
+ 		return 1;
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index a4e5569..454fc5f 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -63,6 +63,7 @@ bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+ void redwood_gpu_mapped(void);
+ void redwood_gpu_unmap(uint64_t address, uint64_t size);
+ void redwood_gpu_to_memory(void * start, uint64_t size);
++void sweet_fast_core(int lane);
+ uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+ extern uint32_t gpu_log;
+ bool redwood_gpu_done(uint32_t fence);
+@@ -1276,6 +1277,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		slowWait("cpu-prep", waitBegan);
+ 		break;
+ 	case kMsmGemSubmit:
++		sweet_fast_core(1);
+ 		ret = submit(&r.submit);
+ 		break;
+ 	case kMsmWaitFence:
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ab20f3b..694874d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -36,6 +36,7 @@
+  */
+ #include "SweetSurface.h"
+ 
++extern "C" void sweet_fast_core(int lane);      /* osfmk/kern/exception.c */
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+@@ -1665,6 +1666,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
++		sweet_fast_core(0);
+ 		fFB->swap(rec);
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e17297a..0f1db06 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -168,7 +168,8 @@ sweet_scanout_eligible(const SweetSurface *s)
+  * before the guard rows, let the GPU's last tiles run into the next buffer: artifacts, a reboot.)
+  */
+ #define SWEET_RES_SIZE  (12u << 20)
+-#define SWEET_RES_COUNT 10
++#define SWEET_RES_COUNT 24      /* sweetres=N of them are taken (default 10): vayu, 6 GB, ran out of 10 */
++static unsigned sweet_res_n = 10;
+ static IOBufferMemoryDescriptor *sweet_res_free[SWEET_RES_COUNT];  /* sweet_surface_lock */
+ /* freed while something still held the memory (a mapping, the GPU): ours again once it lets go */
+ static IOBufferMemoryDescriptor *sweet_res_wait[2 * SWEET_RES_COUNT];
+@@ -184,7 +185,10 @@ sweet_res_fill(void)
+ 		return;
+ 	}
+ 	filled = true;
+-	for (; n < SWEET_RES_COUNT; n++) {
++	if (PE_parse_boot_argn("sweetres", &sweet_res_n, sizeof(sweet_res_n)) && sweet_res_n > SWEET_RES_COUNT) {
++		sweet_res_n = SWEET_RES_COUNT;
++	}
++	for (; n < sweet_res_n; n++) {
+ 		mem[n] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, SWEET_RES_SIZE,
+ 		    0x0000000FFFFFC000ull);
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 6523c8b..7134784 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1273,6 +1273,41 @@ sweet_gov_touch(void)
+ 	__atomic_store_n(&gov_boost_until, mach_absolute_time() + t, __ATOMIC_RELAXED);
+ }
+ 
++/*
++ * sweet_fast_core(lane): bind the calling thread to a big core, once. The CPUs are one SMP set
++ * (mkadt cluster-type 0), so the scheduler puts backboardd's render thread on an A55 as often as
++ * on an A76: 1008 log, 503 of 1200 frames ended on a little core, 9.8 ms a frame outside GL.
++ * lane 0 (display SwapEnd: CoreAnimation's render thread) -> fastcore (default 7, the prime),
++ * lane 1 (GPU submit, maybe Mesa's flush thread) -> fastcore - 1. fastcore=-1: off.
++ */
++extern processor_t cpu_to_processor(int cpu);
++void sweet_fast_core(int lane);
++void
++sweet_fast_core(int lane)
++{
++	static int core = -2;
++	static uint32_t told;
++	thread_t self = current_thread();
++
++	if (core == -2) {
++		int c = 7;
++		(void)PE_parse_boot_argn("fastcore", &c, sizeof(c));
++		core = (c >= 1 && c <= ml_get_max_cpu_number()) ? c : -1;
++	}
++	if (core < 0 || self->bound_processor != PROCESSOR_NULL) {
++		return;
++	}
++	processor_t p = cpu_to_processor(core - (lane ? 1 : 0));
++	if (p == PROCESSOR_NULL) {
++		return;
++	}
++	(void)thread_bind(p);
++	if (told++ < 8) {
++		printf("SWEET GOV: thread %llu (lane %d) bound to cpu %d\n", thread_tid(self), lane, core - (lane ? 1 : 0));
++	}
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ void sweet_gov_screen(int on);
+ void
+ sweet_gov_screen(int on)
+-- 
+2.53.0
+

@@ -1,0 +1,99 @@
+From 25d28a37faa44362d3d971971fd0466f44a40cd2 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:32:34 +0200
+Subject: [PATCH] vayu-0190: GPU DDR vote (SH0/MC0 peak from the apps DRV while
+ the GPU runs and the screen is on; vayuddr=0 off)
+
+---
+ bsd/dev/vayu_gpu.c                    | 33 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  2 ++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 414020d..147099f 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -14,6 +14,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+@@ -67,6 +68,8 @@ static bool vg_step4(void);
+ extern void vayu_redwood_start(void);      /* iokit/Kernel/arm/TopazAdreno.cpp */
+ static void vg_step5(void);
+ extern int sweet_cmddb_aux(const char *res, void *buf, unsigned max);   /* bsd/dev/sweet_rpmh.c */
++extern int sweet_rpmh_bcm_vote(const char *res, unsigned x, unsigned y);  /* bsd/dev/sweet_rpmh.c */
++void vayu_gpu_ddr(int on);
+ 
+ static uint32_t
+ rd(vm_offset_t b, uint32_t off)
+@@ -1501,6 +1504,35 @@ vayu_gpu_report(const char *why)
+ 	    vg_cbg ? rd(vg_cbg, 0x64) : 0u, vg_cbg ? rd(vg_cbg, 0x60) : 0u);
+ }
+ 
++/*
++ * DDR for the GPU, voted from the apps DRV (the GMU's BW table is empty, step 3c): KGSL's
++ * grp3d path 26 -> 512 tops out at ib 7216000 KB/s (DDR 1804 MHz) with ab 0. The BCMs on that
++ * path are SH0 (gem noc) and MC0 (DDR); vote_y (peak) at its field maximum is above every
++ * level's threshold, so the BCM takes its top level. Screen off drops our vote (the other
++ * DRVs keep theirs). vayuddr=0: no votes.
++ */
++void
++vayu_gpu_ddr(int on)
++{
++	static int want = -1, last = -1;
++	if (want < 0) {
++		want = 1;
++		(void)PE_parse_boot_argn("vayuddr", &want, sizeof(want));
++	}
++	if (!want || !vg_ready || on == last) {
++		return;
++	}
++	static const char *const bcm[2] = { "SH0", "MC0" };
++	int err[2] = { 0, 0 };
++	for (unsigned i = 0; i < 2; i++) {
++		for (unsigned t = 0; t < 50 && (err[i] = sweet_rpmh_bcm_vote(bcm[i], 0, on ? 0x3fffu : 0u)) == EBUSY; t++) {
++			delay(1000);            /* touch's QUP0 vote holds the RPMh lock briefly */
++		}
++	}
++	last = on;
++	printf("VAYU GPU: DDR vote %s: SH0 %d MC0 %d\n", on ? "peak" : "dropped", err[0], err[1]);
++}
++
+ static void
+ vg_step5(void)
+ {
+@@ -1533,6 +1565,7 @@ vg_step5(void)
+ 		sweet_log_flush_now();
+ 		return;
+ 	}
++	vayu_gpu_ddr(1);
+ 	vayu_redwood_start();                   /* iokit/Kernel/arm/TopazAdreno.cpp -> RedwoodGPUStart */
+ 	printf("VAYU GPU: step 5: Adreno 640 ready, RedwoodGPU published\n");
+ 	sweet_log_flush_now();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 694874d..deafa4c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,6 +97,7 @@ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int sweet_soc_vayu(void);       /* osfmk/arm64/sweet_early.c */
+ extern "C" int sweet_spmi_init(void);      /* bsd/dev/sweet_spmi.c */
++extern "C" void vayu_gpu_ddr(int on);       /* bsd/dev/vayu_gpu.c */
+ extern "C" void sweet_gov_screen(int on);  /* osfmk/kern/exception.c */
+ extern "C" void vayu_touch_suspend(void);  /* bsd/dev/vayu_touch.c */
+ extern "C" void vayu_touch_resume(void);
+@@ -1752,6 +1753,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			if (changed && sweet_soc_vayu()) {
+ 				sweet_gov_screen(off ? 0 : 1);    /* lowest CPU clocks while off */
++				vayu_gpu_ddr(off ? 0 : 1);        /* the GPU's DDR vote */
+ 			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+-- 
+2.53.0
+

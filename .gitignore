@@ -8,3 +8,8 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+
+# GPU user space build (tools/build-gpu-userland.sh)
+userland/out/
+userland/obj/
+userland/mesa/build-mesa/

@@ -1,0 +1,33 @@
+name: userland
+
+# The GPU user space (Mesa freedreno, libtopaz-gl, libtopaz-inject, the backboardd stand-in) for the
+# iOS root: needs Xcode's iPhoneOS SDK, so it builds on a macOS runner. tools/build-gpu-userland.sh.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          brew install meson ninja bison
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build
+        run: bash tools/build-gpu-userland.sh
+
+      - name: Logs
+        if: failure()
+        run: |
+          tail -n 80 userland/mesa/build-mesa/meson-setup.log || true
+          tail -n 80 userland/mesa/build-mesa/ninja.log || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-userland
+          path: userland/out

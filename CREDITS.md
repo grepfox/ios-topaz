@@ -50,6 +50,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+`userland/gpu/mkeagl.py` and `userland/gpu/eagl_slots.txt` are HackiOS user space files (MIT, same
+licence as above), taken unchanged for the vayu build (`tools/build-gpu-userland.sh`), which follows the
+GL steps of HackiOS's `userland/build.sh`.
+
 ## Others
 
 - **ios-sweet** (dipa-studio): the XNU port this tree is built on.

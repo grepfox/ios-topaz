@@ -1,0 +1,61 @@
+From 19870bed50f192f6e9bd785f01c361fc67e80424 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 10:32:27 +0200
+Subject: [PATCH] vayu-0183: GPU zap: log before each SCM call; vayuzap=0 skips
+ the zap (trust register fallback) to test the CP
+
+---
+ bsd/dev/vayu_gpu.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 00afca8..96797d5 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -954,14 +954,21 @@ vg_zap(void)
+ 	memcpy((void *)(vg_g + G_MEM + 0x1000), mdt, mdt_size);
+ 	flush_dcache64((addr64_t)(vg_g_pa + G_MEM + 0x1000), mdt_size, TRUE);
+ 	uint64_t res = 0, st;
+-	(void)vg_scm(SCM_FN(2, 6), 1, VG_GPU_PAS, 0, 0, &res);                   /* PIL shutdown */
++	/* 1002 boot: the phone hung somewhere in here; one marker per SCM call */
++	printf("VAYU GPU: zap: SCM PIL shutdown\n");
++	sweet_log_flush_now();
++	st = vg_scm(SCM_FN(2, 6), 1, VG_GPU_PAS, 0, 0, &res);                    /* PIL shutdown */
++	printf("VAYU GPU: zap: shutdown %#llx/%#llx, SCM init_image\n", st, res);
++	sweet_log_flush_now();
+ 	st = vg_scm(SCM_FN(2, 1), 2 | (2u << 6), VG_GPU_PAS, vg_g_pa + G_MEM + 0x1000, 0, &res);   /* init_image */
+ 	printf("VAYU GPU: zap init_image %#llx/%#llx\n", st, res);
++	sweet_log_flush_now();
+ 	if (st || res) {
+ 		return false;
+ 	}
+ 	st = vg_scm(SCM_FN(2, 2), 3, VG_GPU_PAS, VG_ZAP_PA, max_a - min_a, &res);   /* mem_setup */
+ 	printf("VAYU GPU: zap mem_setup %#llx/%#llx\n", st, res);
++	sweet_log_flush_now();
+ 	if (st || res) {
+ 		return false;
+ 	}
+@@ -977,6 +984,8 @@ vg_zap(void)
+ 		dst[at + i] = ((const uint8_t *)seg)[i];
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("VAYU GPU: zap: segment copied, SCM auth_and_reset\n");
++	sweet_log_flush_now();
+ 	st = vg_scm(SCM_FN(2, 5), 1, VG_GPU_PAS, 0, 0, &res);                    /* auth_and_reset */
+ 	printf("VAYU GPU: zap auth_and_reset %#llx/%#llx\n", st, res);
+ 	return st == 0 && res == 0;
+@@ -1180,7 +1189,10 @@ vg_step4(void)
+ 	}
+ 	printf("VAYU GPU: step 4a: GPU buffer %#llx\n", vg_g_pa);
+ 	sweet_log_flush_now();
+-	bool zap = vg_zap();
++	/* vayuzap=0: no TZ calls, unsecure through RBBM_SECVID_TRUST_CNTL (KGSL without a zap) */
++	int zap_on = 1;
++	(void)PE_parse_boot_argn("vayuzap", &zap_on, sizeof(zap_on));
++	bool zap = zap_on ? vg_zap() : false;
+ 	printf("VAYU GPU: step 4b: zap shader %s\n", zap ? "loaded" : "NOT loaded (trust register fallback)");
+ 	sweet_log_flush_now();
+ 	if (!vg_smmu_gpu()) {
+-- 
+2.53.0
+

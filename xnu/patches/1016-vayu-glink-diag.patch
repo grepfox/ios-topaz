@@ -1,0 +1,41 @@
+From 2d7257b3bf9db116682ab42584b800ecfeeb5bde Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:46:39 +0200
+Subject: [PATCH] vayu-0196: GLINK wait diagnostics + VERSION resend (10x, 1 s)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 21424f6..fae534e 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -1022,6 +1022,24 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 			LOG("t=%u ms: modem RX FIFO, %u bytes", ms, sz);
+ 		}
+ 	}
++	/*
++	 * vayu 1015 boot: the modem made the descriptor, came READY, never made its FIFO (480) nor
++	 * answered our VERSION, and went FATAL 35 s later. Each second until it answers: the
++	 * descriptor's four indices, whether 480 exists, and VERSION again with a doorbell (10x).
++	 */
++	{
++		static unsigned last_try, tries;
++		if (g_rx_msgs == 0 && ms - last_try >= 1000 && tries < 10) {
++			last_try = ms;
++			tries++;
++			uint32_t sz = 0;
++			void *f480 = smem_get(part, SMEM_GLINK_FIFO_RX, &sz);
++			LOG("t=%u ms: glink wait %u: desc %08x %08x %08x %08x, modem FIFO %s (%u), resend VERSION", ms, tries,
++			    g_desc ? g_desc[0] : 0, g_desc ? g_desc[1] : 0, g_desc ? g_desc[2] : 0, g_desc ? g_desc[3] : 0,
++			    f480 ? "there" : "missing", sz);
++			send_cmd(CMD_VERSION, 1, g_features);
++		}
++	}
+ 	for (int i = 0; i < 64 && g_rx != NULL && rx_one(); i++) {
+ 	}
+ 	txq_pump();
+-- 
+2.53.0
+

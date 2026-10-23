@@ -1,0 +1,163 @@
+From bcf8c8a64c3fb6ed80021fceb98b74c28fb167db Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 20:14:13 +0200
+Subject: [PATCH] vayu-0191: RedwoodWaitsForGPU on vayu (vayuwait=0 off),
+ render thread (fence waits) to cpu 7, vsync workloop to cpu 5, present timing
+ line
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp       |  2 ++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 47 +++++++++++++++++++++++++++
+ osfmk/kern/exception.c                | 13 ++++----
+ 3 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 454fc5f..4588b6a 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1264,6 +1264,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		ret = gemInfo(&r.gemInfo);
+ 		break;
+ 	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
++		sweet_fast_core(0);     /* who waits for frames: the render thread */
+ 		waitBegan = mach_absolute_time();
+ 		IOLockLock(gGPULock);
+ 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
+@@ -1281,6 +1282,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		ret = submit(&r.submit);
+ 		break;
+ 	case kMsmWaitFence:
++		sweet_fast_core(0);     /* who waits for frames: the render thread */
+ 		waitBegan = mach_absolute_time();
+ 		IOLockLock(gGPULock);
+ 		patience = millisecondsUntil(&r.waitFence.timeout);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index deafa4c..31a2024 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -407,6 +407,18 @@ AppleCLCD::start(IOService *provider)
+ 		topaz_adreno_init();
+ 		setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+ 	}
++	if (vayu) {
++		/*
++		 * vayu A640: present() waits for the surface's fence too (topaz_surface_drawn -> RedwoodGPU
++		 * gpuWait -> vayu_gpu_done). Without the property eagl glFinish'ed every frame (1009: about
++		 * 5 ms a frame of the render thread waiting for the GPU). vayuwait=0: eagl waits as before.
++		 */
++		uint32_t vw = 1;
++		(void)PE_parse_boot_argn("vayuwait", &vw, sizeof(vw));
++		if (vw) {
++			setProperty("RedwoodWaitsForGPU", true);
++		}
++	}
+ 	if (vayu) {
+ 		/*
+ 		 * ABL's splash pipe is not known on vayu: take the SSPP whose SRC0
+@@ -598,6 +610,9 @@ AppleCLCD::start(IOService *provider)
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
++	if (sweet_soc_vayu()) {
++		sweet_fast_core(2);     /* the panel copy runs here: on a big core, not an A55 */
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+@@ -1438,9 +1453,38 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	return ok;
+ }
+ 
++/*
++ * CPU-copy presents (vayu): every 300, the average and longest time from the vsync tick's start
++ * of present() to the copied frame, and how much of it was waiting for the GPU's fence.
++ */
++static uint64_t sweet_present_wait;
++static void
++sweet_present_stat(uint64_t began)
++{
++	static uint64_t all, most, waited;
++	static uint32_t n;
++	uint64_t t = mach_absolute_time() - began;
++
++	all += t;
++	most = t > most ? t : most;
++	waited += sweet_present_wait;
++	sweet_present_wait = 0;
++	if (++n == 300) {
++		uint64_t a, m, w;
++		absolutetime_to_nanoseconds(all / n, &a);
++		absolutetime_to_nanoseconds(most, &m);
++		absolutetime_to_nanoseconds(waited / n, &w);
++		IOLog("SWEET FB: 300 presents: %llu us each (%llu us waiting for the GPU), longest %llu us, cpu %d\n",
++		    a / 1000, w / 1000, m / 1000, cpu_number());
++		all = most = waited = 0;
++		n = 0;
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	uint64_t began = mach_absolute_time();
+ 	uint32_t mask = get32(rec, 0x104);
+ 	static int console_only = -1;
+ 
+@@ -1511,7 +1555,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		uint64_t t0 = mach_absolute_time();
+ 		(void)topaz_surface_drawn(s, 100);
++		sweet_present_wait += mach_absolute_time() - t0;
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -1567,6 +1613,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+ 	}
++	sweet_present_stat(began);
+ }
+ 
+ bool
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 7134784..c03b024 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1277,8 +1277,9 @@ sweet_gov_touch(void)
+  * sweet_fast_core(lane): bind the calling thread to a big core, once. The CPUs are one SMP set
+  * (mkadt cluster-type 0), so the scheduler puts backboardd's render thread on an A55 as often as
+  * on an A76: 1008 log, 503 of 1200 frames ended on a little core, 9.8 ms a frame outside GL.
+- * lane 0 (display SwapEnd: CoreAnimation's render thread) -> fastcore (default 7, the prime),
+- * lane 1 (GPU submit, maybe Mesa's flush thread) -> fastcore - 1. fastcore=-1: off.
++ * lane 0 (display SwapEnd, GPU fence waits: CoreAnimation's render thread) -> fastcore (default
++ * 7, the prime), lane 1 (GPU submit: 1009 showed it is another thread, Mesa's) -> fastcore - 1,
++ * lane 2 (the display's vsync workloop, the CPU panel copy) -> fastcore - 2. fastcore=-1: off.
+  */
+ extern processor_t cpu_to_processor(int cpu);
+ void sweet_fast_core(int lane);
+@@ -1294,16 +1295,16 @@ sweet_fast_core(int lane)
+ 		(void)PE_parse_boot_argn("fastcore", &c, sizeof(c));
+ 		core = (c >= 1 && c <= ml_get_max_cpu_number()) ? c : -1;
+ 	}
+-	if (core < 0 || self->bound_processor != PROCESSOR_NULL) {
++	if (core < 0 || lane < 0 || lane > 2 || core - lane < 1 || self->bound_processor != PROCESSOR_NULL) {
+ 		return;
+ 	}
+-	processor_t p = cpu_to_processor(core - (lane ? 1 : 0));
++	processor_t p = cpu_to_processor(core - lane);
+ 	if (p == PROCESSOR_NULL) {
+ 		return;
+ 	}
+ 	(void)thread_bind(p);
+-	if (told++ < 8) {
+-		printf("SWEET GOV: thread %llu (lane %d) bound to cpu %d\n", thread_tid(self), lane, core - (lane ? 1 : 0));
++	if (told++ < 16) {
++		printf("SWEET GOV: thread %llu (lane %d) bound to cpu %d\n", thread_tid(self), lane, core - lane);
+ 	}
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+-- 
+2.53.0
+

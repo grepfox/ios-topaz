@@ -1,0 +1,84 @@
+From 43ed9de986cb876ecfb7f87244eeaa6df61a0b56 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 11:34:51 +0200
+Subject: [PATCH] vayu-0184: GPU step 4: AHB fence to ALLOW before GPU register
+ writes, markers around the CP start; zap without the PIL shutdown call (it
+ never returned)
+
+---
+ bsd/dev/vayu_gpu.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 96797d5..39a6cf4 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -955,10 +955,8 @@ vg_zap(void)
+ 	flush_dcache64((addr64_t)(vg_g_pa + G_MEM + 0x1000), mdt_size, TRUE);
+ 	uint64_t res = 0, st;
+ 	/* 1002 boot: the phone hung somewhere in here; one marker per SCM call */
+-	printf("VAYU GPU: zap: SCM PIL shutdown\n");
+-	sweet_log_flush_now();
+-	st = vg_scm(SCM_FN(2, 6), 1, VG_GPU_PAS, 0, 0, &res);                    /* PIL shutdown */
+-	printf("VAYU GPU: zap: shutdown %#llx/%#llx, SCM init_image\n", st, res);
++	/* 1003 boot: PIL shutdown (topaz's extra call, not in KGSL) never returned; init_image first */
++	printf("VAYU GPU: zap: SCM init_image\n");
+ 	sweet_log_flush_now();
+ 	st = vg_scm(SCM_FN(2, 1), 2 | (2u << 6), VG_GPU_PAS, vg_g_pa + G_MEM + 0x1000, 0, &res);   /* init_image */
+ 	printf("VAYU GPU: zap init_image %#llx/%#llx\n", st, res);
+@@ -1114,6 +1112,8 @@ static bool
+ vg_kick_wait(const char *what)
+ {
+ 	flush_dcache64((addr64_t)(vg_g_pa + G_RING), RB_BYTES, TRUE);
++	printf("VAYU GPU: %s: kicking wptr %u\n", what, vg_wptr % RB_DWORDS);
++	sweet_log_flush_now();
+ 	gpu_w(0x807, vg_wptr % RB_DWORDS);      /* CP_RB_WPTR */
+ 	for (unsigned i = 0; i < 10000; i++) {   /* 100 ms */
+ 		if (gpu_r(0x806) == vg_wptr % RB_DWORDS) {     /* CP_RB_RPTR */
+@@ -1129,6 +1129,13 @@ vg_kick_wait(const char *what)
+ }
+ 
+ /* KGSL a6xx_start with the A640 values (no HWCG, no CP protect for the bring-up) */
++static void
++vg_mark(const char *what)
++{
++	printf("VAYU GPU: step 4c: %s (RBBM_STATUS %#x, fence %#x)\n", what, gpu_r(0x210), gmu_rd(0x23B10));
++	sweet_log_flush_now();
++}
++
+ static void
+ vg_hw_init(void)
+ {
+@@ -1205,16 +1212,27 @@ vg_step4(void)
+ 	}
+ 	memcpy((void *)(vg_g + G_SQE), (const uint8_t *)sqe + 4, sqe_size - 4);
+ 	flush_dcache64((addr64_t)vg_g_pa, G_SIZE, TRUE);
+-	vg_hw_init();
+-	printf("VAYU GPU: step 4c: registers set, RBBM_STATUS %#x\n", gpu_r(0x210));
++	/*
++	 * AHB fence to ALLOW (KGSL keeps A6XX_GMU_AO_AHB_FENCE_CTRL at 0 whenever
++	 * the host touches GPU registers). 1003 boot: no fence setup, the CPU
++	 * hung somewhere after the register init.
++	 */
++	printf("VAYU GPU: step 4c: AHB fence ctrl %#x status %#x -> ALLOW\n", gmu_rd(0x23B10), gmu_rd(0x23B13));
+ 	sweet_log_flush_now();
++	gmu_wr(0x23B10, 0);
++	vg_hw_init();
++	vg_mark("registers set");
+ 	gpu_w64(0x830, vg_g_pa + G_SQE);        /* CP_SQE_INSTR_BASE */
++	vg_mark("SQE base set");
+ 	gpu_w64(0x800, vg_g_pa + G_RING);       /* CP_RB_BASE */
+ 	gpu_w(0x802, 12 | (2 << 8) | (1u << 27));       /* CP_RB_CNTL */
+ 	vg_wptr = 0;
+ 	gpu_w(0x807, 0);
++	vg_mark("ring set");
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	gpu_w(0x808, 1);                        /* CP_SQE_CNTL: start the SQE */
++	delay(1000);
++	vg_mark("SQE started");
+ 	vg_emit(vg_pkt7(0x48, 8));              /* CP_ME_INIT */
+ 	vg_emit(0x2f);
+ 	vg_emit(3);
+-- 
+2.53.0
+

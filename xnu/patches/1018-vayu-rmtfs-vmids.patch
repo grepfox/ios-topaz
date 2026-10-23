@@ -1,0 +1,52 @@
+From 25d547752ec3ae306305c9317cd3d10635ca4163 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:26:48 +0200
+Subject: [PATCH] vayu: rmtfs buffer to HLOS+MSA only, fallback to the other
+ VMID set
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 161abcf..df588e9 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3223,6 +3223,7 @@ static const struct { const char *path, *part; } rmtfs_parts[] = {
+ 	{ "/boot/modem_fsg", "fsg" },
+ };
+ static uint64_t rmtfs_pa;
++static bool g_rmtfs_nav = true;           /* rmtfs buffer also to VMID_NAV (topaz); vayu: no */
+ static uint8_t *rmtfs_va;
+ static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
+ 
+@@ -3335,8 +3336,17 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 			if (rmtfs_va == NULL) {
+ 				rmtfs_pa = 0;
+ 			} else {
++				/*
++				 * msm_sharedmem: NAV only with qcom,vm-nav-path. vayu's rmtfs_sharedmem has none, and
++				 * its TZ refused {HLOS, MSA, NAV} (1017: ret -2, modem FATAL 10 ms later). Try the
++				 * SoC's set first, then the other one.
++				 */
+ 				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
+-				(void)scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 3);
++				unsigned n = g_rmtfs_nav ? 3 : 2;
++				if (scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, n) != 0 &&
++				    scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, n == 3 ? 2 : 3) != 0) {
++					LOG("t=%u ms: rmtfs: buffer not given to the modem", g_ms);
++				}
+ 			}
+ 		}
+ 		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);
+@@ -6750,6 +6760,7 @@ soc_select_vayu(void)
+ 	g_smmu_size = 0x00100000u;
+ 	g_wlan_sid = 0x640;                     /* icnss iommus = <&apps_smmu 0x0640 0x1> */
+ 	g_wlan_mem = 0x18800000ull;
++	g_rmtfs_nav = false;                    /* rmtfs_sharedmem: no qcom,vm-nav-path */
+ 	fw_files = fw_files_vayu;
+ 	fw_files_n = sizeof(fw_files_vayu) / sizeof(fw_files_vayu[0]);
+ 	fw_ext = fw_ext_vayu;
+-- 
+2.53.0
+

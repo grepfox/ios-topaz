@@ -2,7 +2,7 @@
 
 Port of this repository (topaz, itself a port of sweet) to the Xiaomi **Poco X3 Pro** (`vayu`, Qualcomm **SM8150-AC** / Snapdragon 860, 6 GB). Branch `vayu`.
 
-**Status (2026-10-21): iOS 16.7.16 boots to the lock screen** on all eight cores with 5 GiB of RAM, power and volume keys, **touch** (Novatek NT36672C over GPI DMA, since 0168) and a live kernel log over USB (`sweetusb=2`, `tools/sweet-usbnet.sh`). Not yet: wallpaper (as on topaz), battery, Wi-Fi, audio. The first boot of a new root waits several minutes on the Apple logo while LaunchServices builds its database.
+**Status (2026-10-21): iOS 16.7.16 boots to the lock screen** on all eight cores with 5 GiB of RAM, power and volume keys, **touch** (Novatek NT36672C over GPI DMA, since 0168) and a live kernel log over USB (`sweetusb=2`, `tools/sweet-usbnet.sh`). Battery (PM8150B FG gen4), power button / WLED backlight and a load governor work too. GPU (Adreno 640, `bsd/dev/vayu_gpu.c`, `vayugpu=4`): GMU boot, HFI, GX power, zap shader via TZ, command processor and a GPU memory write work (2026-10-23); not yet wired to the renderer. Not yet: Wi-Fi, audio, camera. The first boot of a new root waits several minutes on the Apple logo while LaunchServices builds its database.
 
 Kernel patch numbers: the vayu patches were written as 0140-0175 and renumbered to 0960-0995 when upstream's HackiOS release (topaz 0140-0152, 0900-0950) was merged; text below uses the original numbers.
 

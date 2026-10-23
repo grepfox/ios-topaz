@@ -19,6 +19,8 @@ DYN=("$CC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall)
 
 # 1. Mesa (fetches the release tarball, applies userland/mesa/*.patch, adds redwood-drm)
 mkdir -p "$U/mesa/build-mesa"
+# mk-mesa-mac.sh (from upstream's private tree) wants its patches and redwood-drm in mesa/ beside it
+ln -sfn . "$U/mesa/mesa"
 bash "$U/mesa/mk-mesa-mac.sh"
 M=$U/mesa/build-mesa/out
 ls -l "$M/libOSMesa.8.dylib" "$M/gl.xml" "$M/exported-gl.txt"

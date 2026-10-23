@@ -13,3 +13,4 @@ __pycache__/
 userland/out/
 userland/obj/
 userland/mesa/build-mesa/
+userland/mesa/mesa

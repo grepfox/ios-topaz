@@ -1,0 +1,1996 @@
+From c18bd0c69450709d8e7851ea8c36c0882b628999 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 20:56:52 +0200
+Subject: [PATCH] vayu-0193: TopazModem on SM8150 (modem=1, wifi=1): vayu
+ addresses, firmware table of vayu NON-HLOS V14.0.3.0 (tools/fwtable.py), AOP
+ QMP load_state, vdd_cx/vdd_mss TURBO, WCN3998 rails; low GPU pool 128 MB
+
+---
+ bsd/conf/files                      |    1 +
+ bsd/dev/sweet_qmp.c                 |  201 ++++
+ bsd/dev/sweet_rpmh.c                |   92 ++
+ iokit/Kernel/arm/TopazAdreno.cpp    |    4 +-
+ iokit/Kernel/arm/TopazModem.cpp     |  122 ++-
+ iokit/Kernel/arm/TopazModemVayuFw.h | 1390 +++++++++++++++++++++++++++
+ 6 files changed, 1787 insertions(+), 23 deletions(-)
+ create mode 100644 bsd/dev/sweet_qmp.c
+ create mode 100644 iokit/Kernel/arm/TopazModemVayuFw.h
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 3054673..1b436c2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/vayu_touch.c			standard
+ bsd/dev/vayu_gpu.c			standard
++bsd/dev/sweet_qmp.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+diff --git a/bsd/dev/sweet_qmp.c b/bsd/dev/sweet_qmp.c
+new file mode 100644
+index 0000000..4b32bb3
+--- /dev/null
++++ b/bsd/dev/sweet_qmp.c
+@@ -0,0 +1,201 @@
++/*
++ * vayu (SM8150): one message to the AOP over QMP, polled. Port of the Linux 4.14 msm_qmp.c state
++ * machine (YAAP kernel drivers/mailbox/msm_qmp.c) for qcom,qmp-aop@c300000: message RAM
++ * 0xc300000, doorbell bit 0 of the APCS IPC register 0x17c0000c. The AOP is the "ucore", we
++ * are the "mcore": we re-open the link as Linux does at boot, open the channel, write
++ * [length][text] into our mailbox and wait for the AOP to zero the length (taken).
++ *
++ * Used for "{class: image, res: load_state, name: modem, val: on}" before the modem's PAS
++ * boot (peripheral-loader.c pil_notify_aop, qcom,signal-aop). Thread context only.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_aop_send(const char *msg);
++
++#define QMP_MSGRAM      0x0c300000u
++#define QMP_IRQ_REG     0x17c0000cu
++#define QMP_IRQ_MASK    0x1u
++#define QMP_MAGIC       0x4d41494cu     /* "MAIL" */
++#define LINK_DOWN       0xFFFF0000u
++#define LINK_UP         0x0000FFFFu
++#define CH_DISC         0xFFFF0000u
++#define CH_CONN         0x0000FFFFu
++#define QMP_MSG_LEN     96              /* peripheral-loader.c MAX_LEN */
++
++/* struct mbox_desc: magic, version, features, ucore{6 words}, mcore{6 words} */
++#define D_MAGIC         0x00
++#define U_LINK          0x0c
++#define U_LINK_ACK      0x10
++#define U_CH            0x14
++#define U_CH_ACK        0x18
++#define U_MBOX_SIZE     0x1c
++#define U_MBOX_OFF      0x20
++#define M_LINK          0x24
++#define M_LINK_ACK      0x28
++#define M_CH            0x2c
++#define M_CH_ACK        0x30
++#define M_MBOX_SIZE     0x34
++#define M_MBOX_OFF      0x38
++
++static volatile uint8_t *qmp_ram;
++static volatile uint32_t *qmp_irq;
++static bool qmp_open;
++static unsigned qmp_lock;
++
++static uint32_t
++q_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(qmp_ram + off);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++q_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(qmp_ram + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++q_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*qmp_irq = QMP_IRQ_MASK;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* acknowledge the AOP's channel state if it changed (Linux does it in every state) */
++static void
++q_ack_ucore_ch(void)
++{
++	uint32_t ch = q_rd(U_CH);
++	if (ch != q_rd(U_CH_ACK)) {
++		q_wr(U_CH_ACK, ch);
++		q_kick();
++	}
++}
++
++/* drop whatever the AOP put in its mailbox (replies are not needed here) */
++static void
++q_drain_ucore(void)
++{
++	uint32_t off = q_rd(U_MBOX_OFF);
++	if (off != 0 && off < 0x1000 && q_rd(off) != 0) {
++		q_wr(off, 0);
++		q_kick();
++	}
++}
++
++static int
++q_connect(void)
++{
++	if (q_rd(D_MAGIC) != QMP_MAGIC) {
++		printf("SWEET QMP: no AOP mailbox (magic %#x)\n", q_rd(D_MAGIC));
++		return ENODEV;
++	}
++	printf("SWEET QMP: AOP link %#x/%#x ch %#x/%#x mbox %#x+%#x; ours link %#x/%#x ch %#x/%#x mbox %#x+%#x\n",
++	    q_rd(U_LINK), q_rd(U_LINK_ACK), q_rd(U_CH), q_rd(U_CH_ACK), q_rd(U_MBOX_OFF), q_rd(U_MBOX_SIZE),
++	    q_rd(M_LINK), q_rd(M_LINK_ACK), q_rd(M_CH), q_rd(M_CH_ACK), q_rd(M_MBOX_OFF), q_rd(M_MBOX_SIZE));
++	if (q_rd(M_MBOX_SIZE) < QMP_MSG_LEN + 4 || q_rd(M_MBOX_OFF) == 0 || q_rd(M_MBOX_OFF) + q_rd(M_MBOX_SIZE) > 0x1000) {
++		printf("SWEET QMP: our mailbox is not described\n");
++		return ENODEV;
++	}
++	/* LINK_DISCONNECTED -> NEGOTIATION (init_mcore_state) */
++	uint32_t size = q_rd(M_MBOX_SIZE), off = q_rd(M_MBOX_OFF);
++	q_wr(U_LINK_ACK, q_rd(U_LINK));
++	q_wr(M_LINK, LINK_UP);
++	q_wr(M_LINK_ACK, LINK_DOWN);
++	q_wr(M_CH, CH_DISC);
++	q_wr(M_CH_ACK, CH_DISC);
++	q_wr(M_MBOX_SIZE, size);
++	q_wr(M_MBOX_OFF, off);
++	q_kick();
++	unsigned t;
++	for (t = 0; t < 1000 && !(q_rd(M_LINK_ACK) == LINK_UP && q_rd(M_LINK) == LINK_UP); t++) {
++		q_ack_ucore_ch();
++		delay(1000);
++	}
++	if (t == 1000) {
++		printf("SWEET QMP: link not acknowledged (ours %#x/%#x)\n", q_rd(M_LINK), q_rd(M_LINK_ACK));
++		return ETIMEDOUT;
++	}
++	/* LINK_CONNECTED -> LOCAL_CONNECTING -> CHANNEL_CONNECTED (qmp_startup) */
++	q_wr(M_CH, CH_CONN);
++	q_kick();
++	for (t = 0; t < 1000; t++) {
++		q_ack_ucore_ch();
++		if (q_rd(M_CH_ACK) == CH_CONN && q_rd(U_CH) == CH_CONN && q_rd(U_CH_ACK) == CH_CONN) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("SWEET QMP: channel %s after %u ms (AOP ch %#x/%#x, ours %#x/%#x)\n", t < 1000 ? "open" : "NOT open", t,
++	    q_rd(U_CH), q_rd(U_CH_ACK), q_rd(M_CH), q_rd(M_CH_ACK));
++	return t < 1000 ? 0 : ETIMEDOUT;
++}
++
++int
++sweet_aop_send(const char *msg)
++{
++	int err = 0;
++	if (msg == NULL || strlen(msg) >= QMP_MSG_LEN) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&qmp_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (qmp_ram == NULL) {
++		qmp_ram = (volatile uint8_t *)ml_io_map(QMP_MSGRAM, 0x1000);
++		qmp_irq = (volatile uint32_t *)ml_io_map(QMP_IRQ_REG & ~0xfffu, 0x1000);
++		if (qmp_irq != NULL) {
++			qmp_irq = (volatile uint32_t *)((volatile uint8_t *)qmp_irq + (QMP_IRQ_REG & 0xfffu));
++		}
++	}
++	if (qmp_ram == NULL || qmp_irq == NULL) {
++		err = ENOMEM;
++		goto out;
++	}
++	if (!qmp_open) {
++		if ((err = q_connect()) != 0) {
++			goto out;
++		}
++		qmp_open = true;
++	}
++	uint32_t off = q_rd(M_MBOX_OFF);
++	unsigned t;
++	for (t = 0; t < 1000 && q_rd(off) != 0; t++) {      /* the previous message taken */
++		delay(1000);
++	}
++	if (t == 1000) {
++		err = EBUSY;
++		goto out;
++	}
++	uint32_t w[QMP_MSG_LEN / 4];
++	bzero(w, sizeof(w));
++	memcpy(w, msg, strlen(msg));
++	for (unsigned i = 0; i < QMP_MSG_LEN / 4; i++) {
++		q_wr(off + 4 + 4 * i, w[i]);
++	}
++	q_wr(off, QMP_MSG_LEN);
++	q_kick();
++	for (t = 0; t < 1000 && q_rd(off) != 0; t++) {
++		q_ack_ucore_ch();
++		q_drain_ucore();
++		delay(1000);
++	}
++	q_drain_ucore();
++	printf("SWEET QMP: \"%s\" %s after %u ms\n", msg, t < 1000 ? "taken" : "NOT taken", t);
++	err = t < 1000 ? 0 : ETIMEDOUT;
++out:
++	__atomic_store_n(&qmp_lock, 0, __ATOMIC_RELEASE);
++	return err;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 1ad7fa8..d20b744 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -396,6 +396,98 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * vayu modem/WLAN power (TopazModem vayu_power_up), ACTIVE set only.
++ * sweet_rpmh_arc_vote: an ARC rail ("cx.lvl", "mss.lvl") at the lowest of its levels that is at
++ * least vlvl (cmd-db aux: u16 voltage levels; the vote is that level's index, as Linux's
++ * rpmh-arc-regulator sends it). sweet_rpmh_ldo: one of the WCN3998's PMIC5 LDOs on, HPM, at mv,
++ * only from this list (DT icnss supplies and their ranges).
++ */
++int sweet_cmddb_aux(const char *res, void *buf, unsigned max);
++int sweet_rpmh_arc_vote(const char *res, unsigned vlvl);
++int sweet_rpmh_ldo(const char *res, unsigned mv);
++
++#define RH_ARC          3u
++
++int
++sweet_rpmh_arc_vote(const char *res, unsigned vlvl)
++{
++	uint16_t lv[16] = {0};
++	int len = sweet_cmddb_aux(res, lv, sizeof(lv));
++	unsigned n = len > 0 ? (unsigned)len / 2 : 0, idx = 0;
++
++	if (n == 0) {
++		printf("SWEET RPMH: %s: no level table (%d)\n", res, len);
++		return EINVAL;
++	}
++	while (idx + 1 < n && lv[idx + 1] != 0 && lv[idx] < vlvl) {
++		idx++;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_ARC, &address);
++	}
++	if (!error) {
++		const uint32_t offsets[1] = {0};
++		const uint32_t values[1] = {idx};
++		error = rh_send(address, 1, offsets, values);
++	}
++	printf("SWEET RPMH: ARC %s level %u (vlvl %u, wanted %u): %d\n", res, idx, lv[idx], vlvl, error);
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++int
++sweet_rpmh_ldo(const char *res, unsigned mv)
++{
++	static const struct { const char *name; unsigned lo, hi; } ok[] = {
++		{ "ldoa1", 752, 800 },          /* vdd-cx-mx */
++		{ "ldoa7", 1704, 1904 },        /* vdd-1.8-xo */
++		{ "ldoc2", 1250, 1350 },        /* vdd-1.3-rfa */
++		{ "ldoc11", 2950, 3400 },       /* vdd-3.3-ch0 */
++	};
++	unsigned i;
++	for (i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
++		if (res && strcmp(res, ok[i].name) == 0 && mv >= ok[i].lo && mv <= ok[i].hi) {
++			break;
++		}
++	}
++	if (i == sizeof(ok) / sizeof(ok[0])) {
++		printf("SWEET RPMH: %s %u mV not in the WLAN rail list\n", res ? res : "(null)", mv);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, &address);
++	}
++	if (!error) {
++		const uint32_t offsets[3] = {0, 8, 4};  /* voltage, mode (HPM 7), enable last */
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(address, 3, offsets, values);
++	}
++	printf("SWEET RPMH: %s %u mV on: %d\n", res, mv, error);
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /*
+  * cmd-db aux data of one resource (e.g. ARC "gfx.lvl": u16 voltage levels,
+  * zero padded), read only. Returns the length copied, or -errno.
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index db126a3..1673c91 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -325,7 +325,7 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	if (!gpu_pool_ready) {
+ 		if (sweet_soc_vayu()) {
+ 			/*
+-			 * 192 MB below the kernel by default. 1007 boot: Mesa ran it dry
++			 * 128 MB below the kernel by default (it was 192; TopazModem's pool is at 0xbb000000). 1007 boot: Mesa ran it dry
+ 			 * ("the GPU pool has no 12582912 bytes left"). With maxmem=4352 the
+ 			 * kernel ends at 0x1d0000000 (its RAM starts at 0xc0000000) and the
+ 			 * top 768 MB of DRAM are the pool (the GPU stream maps all DRAM).
+@@ -336,7 +336,7 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 				gpu_pool_size = 0x30000000ull;
+ 			} else {
+ 				gpu_pool_base = 0xb0000000ull;
+-				gpu_pool_size = 0x0c000000ull;
++				gpu_pool_size = 0x08000000ull;  /* 128 MB: 0xbb000000 + 16 MB is TopazModem's pool */
+ 			}
+ 			IOLog("TopazGPU: vayu GPU pool %#llx + %llu MB\n", gpu_pool_base, gpu_pool_size >> 20);
+ 		}
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 79fdaea..7134d89 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -45,17 +45,28 @@ extern "C" int sweet_soc_vayu(void);       /* osfmk/arm64/sweet_early.c */
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+ /* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+-#define MODEM_POOL_BASE     0xE0000000ull
++/*
++ * vayu (SM8150): the same blocks at other addresses (YAAP sm8150.dtsi / xiaomi base), picked in
++ * soc_select(). Modem pool: ABL's /memory has 0x80000000+0x3cc00000 and xnu starts at
++ * 0xc0000000, so 0xbb000000 + 16 MB is RAM nobody else uses (the GPU's low pool ends there).
++ */
++static uint64_t g_modem_pool = 0xE0000000ull;
++#define MODEM_POOL_BASE     g_modem_pool
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+-#define SMEM_PA             0x46000000ull
++static uint64_t g_smem_pa = 0x46000000ull;
++#define SMEM_PA             g_smem_pa
+ #define SMEM_SIZE           0x00200000u
+ #define SMEM_GLOBAL_HOST    0xFFFE
+-#define TCSR_MUTEX_PA       0x00340000ull       /* qcom,tcsr-mutex, stride 0x1000 */
++static uint64_t g_tcsr_mutex_pa = 0x00340000ull;
++#define TCSR_MUTEX_PA       g_tcsr_mutex_pa     /* qcom,tcsr-mutex, stride 0x1000 */
+ #define SMEM_HWLOCK         3
+ #define HWLOCK_APPS_ID      1
+-#define APCS_PA             0x0F111000ull
+-#define APCS_IPC            8                   /* apcs_glb mailbox */
++static uint64_t g_apcs_pa = 0x0F111000ull;
++static uint32_t g_apcs_ipc = 8;
++#define APCS_PA             g_apcs_pa
++#define APCS_IPC            g_apcs_ipc          /* apcs_glb mailbox */
++static uint32_t g_carve_base = 0x4AB00000u, g_carve_size = 0x6900000u;   /* modem carveout */
+ #define MPSS_SMP2P_BIT      14
+ 
+ #define ITEM_SMP2P_OUT      428                 /* apps -> modem */
+@@ -178,7 +189,10 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ 
+ static char fw_part[32] = "modem_a";
+-static const struct { const char *name; uint32_t off, size, crc; } fw_files[] = {
++struct fw_file { const char *name; uint32_t off, size, crc; };
++struct fw_extent { uint32_t off, len; };
++struct fw_entry { const char *path; uint32_t size; uint16_t ext, next; };
++static const struct fw_file fw_files_topaz[] = {
+ 	{ "modem.b00", 0x1e1d000, 0x414, 0xaacde80c },
+ 	{ "modem.b01", 0x1e21000, 0x1f78, 0x80555ebe },
+ 	{ "modem.b02", 0x1e25000, 0x2930, 0x0858b3a0 },
+@@ -212,7 +226,7 @@ static const struct { const char *name; uint32_t off, size, crc; } fw_files[] =
+ static int
+ fw_find(const char *name)
+ {
+-	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
++	for (unsigned i = 0; i < fw_files_n; i++) {
+ 		if (strcmp(fw_files[i].name, name) == 0) {
+ 			return (int)i;
+ 		}
+@@ -1039,7 +1053,7 @@ glink_summary(void)
+ #define QMI_RESP            2
+ 
+ /* generated by fwtable_all.py from NON-HLOS.bin (HyperOS 2.0.208 modem_a): 657 files, 657 extents */
+-static const struct { uint32_t off, len; } fw_ext[] = {
++static const struct fw_extent fw_ext_topaz[] = {
+ 	{ 0x25000, 0x4d4 },
+ 	{ 0x29000, 0x2098 },
+ 	{ 0x2d000, 0x14ef4 },
+@@ -1698,7 +1712,7 @@ static const struct { uint32_t off, len; } fw_ext[] = {
+ 	{ 0x7239000, 0x2ecfa },
+ 	{ 0x7269000, 0x3a39c0 },
+ };
+-static const struct { const char *path; uint32_t size; uint16_t ext, next; } fw_all[] = {
++static const struct fw_entry fw_all_topaz[] = {
+ 	{ "image/adsp.b00", 0x4d4, 0, 1 },
+ 	{ "image/adsp.b01", 0x2098, 1, 1 },
+ 	{ "image/adsp.b02", 0x14ef4, 2, 1 },
+@@ -2357,11 +2371,17 @@ static const struct { const char *path; uint32_t size; uint16_t ext, next; } fw_
+ 	{ "image/widevine.mbn", 0x2ecfa, 655, 1 },
+ 	{ "image/wlanmdsp.mbn", 0x3a39c0, 656, 1 },
+ };
++#include "TopazModemVayuFw.h"
++static const struct fw_file *fw_files = fw_files_topaz;
++static unsigned fw_files_n = sizeof(fw_files_topaz) / sizeof(fw_files_topaz[0]);
++static const struct fw_extent *fw_ext = fw_ext_topaz;
++static const struct fw_entry *fw_all = fw_all_topaz;
++static unsigned fw_all_n = sizeof(fw_all_topaz) / sizeof(fw_all_topaz[0]);
+ 
+ static int
+ fw_all_find(const char *path)
+ {
+-	for (unsigned i = 0; i < sizeof(fw_all) / sizeof(fw_all[0]); i++) {
++	for (unsigned i = 0; i < fw_all_n; i++) {
+ 		if (strcmp(fw_all[i].path, path) == 0) {
+ 			return (int)i;
+ 		}
+@@ -3059,7 +3079,8 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ #define WLFW_MSA_INFO       0x2D
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+-#define WLFW_MSA_BASE       0x51900000u         /* DTB wlan_msa_region, inside "PIL Reserved" */
++static uint32_t g_msa_base = 0x51900000u;
++#define WLFW_MSA_BASE       g_msa_base          /* DTB wlan_msa_region, inside "PIL Reserved" (vayu 0x8bc00000) */
+ #define WLFW_MSA_SIZE       0x00100000u
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+ #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+@@ -3472,9 +3493,12 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+  *  - WMI (TLV): SERVICE_READY -> INIT -> READY, then a passive scan (nothing is transmitted);
+  *    each BSS seen is logged once, its BSSID masked.
+  */
+-#define SMMU_PA             0x0C600000ull
+-#define SMMU_SIZE           0x00080000u
+-#define WLAN_SID            0x1A0
++static uint64_t g_smmu_pa = 0x0C600000ull;
++#define SMMU_PA             g_smmu_pa
++static uint32_t g_smmu_size = 0x00080000u;
++#define SMMU_SIZE           g_smmu_size
++static uint32_t g_wlan_sid = 0x1A0;
++#define WLAN_SID            g_wlan_sid
+ #define WLAN_SID_MASK       0x1
+ #define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
+ #define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
+@@ -3567,9 +3591,10 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 
+ /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
+ 
+-#define CE_PA               (0x0C800000ull + 0x240000)
++static uint64_t g_wlan_mem = 0x0C800000ull;    /* icnss membase */
++#define CE_PA               (g_wlan_mem + 0x240000)
+ #define CE_COUNT            12
+-#define SHADOW_PA           (0x0C800000ull + 0x32000)
++#define SHADOW_PA           (g_wlan_mem + 0x32000)
+ #define SR_BASE_LO          0x00
+ #define SR_BASE_HI          0x04
+ #define SR_SIZE             0x08
+@@ -6157,8 +6182,8 @@ modem_boot(void)
+ 			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
+ 		}
+ 		LOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
+-		if (hash == ~0u || min_a < 0x4AB00000u || max_a > 0x4AB00000u + 0x6900000u) {
+-			LOG("unexpected layout (carveout is 0x4ab00000+0x6900000)");
++		if (hash == ~0u || min_a < g_carve_base || max_a > g_carve_base + g_carve_size) {
++			LOG("unexpected layout (carveout is %#x+%#x)", g_carve_base, g_carve_size);
+ 			goto out;
+ 		}
+ 
+@@ -6361,6 +6386,8 @@ topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	return smmu_identity(sid, mask, name);
+ }
+ 
++static void vayu_power_up(void);
++
+ static void
+ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -6379,6 +6406,9 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
+ 	}
++	if (sweet_soc_vayu()) {
++		vayu_power_up();
++	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
+ 	}
+@@ -6388,6 +6418,58 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 
+ extern "C" void topaz_sta_init(void);
+ 
++/*
++ * vayu (SM8150, WCN3998): the same blocks, other addresses (YAAP kernel sm8150.dtsi, xiaomi
++ * base sm8150.dtsi), and the firmware of vayu's NON-HLOS (tools/fwtable.py). The modem
++ * partition is "modem" (no A/B).
++ */
++static void
++soc_select_vayu(void)
++{
++	g_modem_pool = 0xBB000000ull;
++	g_smem_pa = 0x86000000ull;
++	g_tcsr_mutex_pa = 0x01F40000ull;
++	g_apcs_pa = 0x17C00000ull;
++	g_apcs_ipc = 0xC;                       /* apcs: syscon@17c0000c */
++	g_carve_base = 0x8E000000u;
++	g_carve_size = 0x9600000u;
++	g_msa_base = 0x8BC00000u;               /* pil_wlan_fw_region (0x180000), MSA 0x100000 */
++	g_smmu_pa = 0x15000000ull;
++	g_smmu_size = 0x00100000u;
++	g_wlan_sid = 0x640;                     /* icnss iommus = <&apps_smmu 0x0640 0x1> */
++	g_wlan_mem = 0x18800000ull;
++	fw_files = fw_files_vayu;
++	fw_files_n = sizeof(fw_files_vayu) / sizeof(fw_files_vayu[0]);
++	fw_ext = fw_ext_vayu;
++	fw_all = fw_all_vayu;
++	fw_all_n = sizeof(fw_all_vayu) / sizeof(fw_all_vayu[0]);
++	strlcpy(fw_part, "modem", sizeof(fw_part));
++	IOLog("TopazModem: vayu: SM8150 MSS/WCN3998 addresses, firmware of NON-HLOS V14.0.3.0 (%u files)\n", fw_all_n);
++}
++
++/*
++ * What Linux's PIL does on SM8150 before the TrustZone calls (subsys-pil-tz, peripheral-loader):
++ * tell the AOP the modem image is loading ("qcom,signal-aop"), and vote vdd_cx and vdd_mss to
++ * TURBO (qcom,vdd_cx-uV-uA / vdd_mss). With wifi=1, the WCN3998's rails as icnss votes them:
++ * vdd-cx-mx L1A 752 mV, vdd-1.8-xo L7A, vdd-1.3-rfa L2C, vdd-3.3-ch0 L11C 3104 mV.
++ */
++extern "C" int sweet_aop_send(const char *msg);                     /* bsd/dev/sweet_qmp.c */
++extern "C" int sweet_rpmh_arc_vote(const char *res, unsigned vlvl);  /* bsd/dev/sweet_rpmh.c */
++extern "C" int sweet_rpmh_ldo(const char *res, unsigned mv);
++
++static void
++vayu_power_up(void)
++{
++	int aop = sweet_aop_send("{class: image, res: load_state, name: modem, val: on}");
++	int cx = sweet_rpmh_arc_vote("cx.lvl", 384), mss = sweet_rpmh_arc_vote("mss.lvl", 384);
++	LOG("vayu: AOP load_state modem on: %d; vdd_cx TURBO %d, vdd_mss TURBO %d", aop, cx, mss);
++	if (wifi_enabled()) {
++		int a = sweet_rpmh_ldo("ldoa1", 752), b = sweet_rpmh_ldo("ldoa7", 1800);
++		int c = sweet_rpmh_ldo("ldoc2", 1304), d = sweet_rpmh_ldo("ldoc11", 3104);
++		LOG("vayu: WCN3998 rails L1A %d L7A %d L2C %d L11C %d", a, b, c, d);
++	}
++}
++
+ extern "C" void
+ topaz_modem_init(void)
+ {
+@@ -6399,9 +6481,7 @@ topaz_modem_init(void)
+ 		return;
+ 	}
+ 	if (sweet_soc_vayu()) {
+-		/* SM6225 modem/WCN3988 addresses; vayu's MSS and WCN3998 are not ported */
+-		IOLog("TOPAZ MODEM: not on vayu, modem=1 ignored\n");
+-		return;
++		soc_select_vayu();
+ 	}
+ 	started = true;
+ 	topaz_sta_init();                           /* private: bsd/dev/topaz_sta.c (en0 + Apple80211 for wifid) */
+diff --git a/iokit/Kernel/arm/TopazModemVayuFw.h b/iokit/Kernel/arm/TopazModemVayuFw.h
+new file mode 100644
+index 0000000..0f848a7
+--- /dev/null
++++ b/iokit/Kernel/arm/TopazModemVayuFw.h
+@@ -0,0 +1,1390 @@
++/* generated by tools/fwtable.py from vayu NON-HLOS.bin (MIUI V14.0.3.0.TJUMIXM firmware-update): offsets in the modem partition */
++static const struct fw_file fw_files_vayu[] = {
++	{ "modem.b00", 0x4f63000, 0x454, 0x57ed1264 },
++	{ "modem.b01", 0x4f67000, 0x1fd8, 0x81483abe },
++	{ "modem.b02", 0x4f6b000, 0x2020, 0x0c5a4ddf },
++	{ "modem.b03", 0x4f6f000, 0x2150, 0x832f42dc },
++	{ "modem.b04", 0x4f73000, 0x3b6a8, 0x06fb05f1 },
++	{ "modem.b05", 0x4faf000, 0x42d90, 0x6c786136 },
++	{ "modem.b06", 0x4ff3000, 0xd680, 0x5a777cca },
++	{ "modem.b07", 0x5003000, 0x20488, 0x1253411e },
++	{ "modem.b08", 0x5027000, 0x1c054, 0xcbd2c512 },
++	{ "modem.b09", 0x5047000, 0x268e64, 0x0bc9fd5f },
++	{ "modem.b10", 0x52b3000, 0x14c000, 0x6b97de7f },
++	{ "modem.b11", 0x53ff000, 0x3e78, 0xbce5c6b5 },
++	{ "modem.b12", 0x5403000, 0x85c0, 0xd643f762 },
++	{ "modem.b13", 0x540f000, 0xd3990, 0xcecb2c9b },
++	{ "modem.b14", 0x54e3000, 0x4c000, 0x718bbbcc },
++	{ "modem.b15", 0x552f000, 0x1e4000, 0xcb77e3a3 },
++	{ "modem.b17", 0x5713000, 0x85c30, 0xed7943e6 },
++	{ "modem.b18", 0x579b000, 0x1a61b49, 0xa131ea2b },
++	{ "modem.b19", 0x71ff000, 0x4df2dc, 0xc21bf80a },
++	{ "modem.b20", 0x76df000, 0x44c, 0x9aa8ba15 },
++	{ "modem.b22", 0x76e3000, 0x128c0, 0xf803575b },
++	{ "modem.b23", 0x76f7000, 0x1d1a040, 0xf82e4565 },
++	{ "modem.b24", 0x9413000, 0xaf15f, 0x428d1eb3 },
++	{ "modem.b25", 0x94c3000, 0x20000, 0x6dcf7566 },
++	{ "modem.b26", 0x94e3000, 0x2d, 0xbba0c65a },
++	{ "modem.b27", 0x94e7000, 0x400000, 0xe1d61a41 },
++	{ "modem.b28", 0x98e7000, 0x824dc, 0xcec6c33a },
++	{ "modem.b29", 0x996b000, 0x11da4, 0x63a2dfb3 },
++	{ "modem.b30", 0x997f000, 0x1328, 0x398d1339 },
++	{ "modem.b31", 0x9983000, 0x80, 0x1c5852d5 },
++	{ "modem.mdt", 0x9987000, 0x242c, 0x5a646a92 },
++};
++static const struct fw_extent fw_ext_vayu[] = {
++	{ 0x2b000, 0x214 },
++	{ 0x2f000, 0x1c78 },
++	{ 0x33000, 0x221c },
++	{ 0x37000, 0x32fe8 },
++	{ 0x6b000, 0x1b9808 },
++	{ 0x227000, 0xdaac4 },
++	{ 0x303000, 0xb80 },
++	{ 0x307000, 0xb318 },
++	{ 0x313000, 0x85780 },
++	{ 0x39b000, 0x6c },
++	{ 0x39f000, 0x9502b0 },
++	{ 0xcf3000, 0x858d0 },
++	{ 0xd7b000, 0xf80 },
++	{ 0xd7f000, 0x8a28c },
++	{ 0xe0b000, 0x1e8c },
++	{ 0x1f000, 0x193 },
++	{ 0x23000, 0x22b },
++	{ 0xc213000, 0x66d8 },
++	{ 0xc21b000, 0x66d8 },
++	{ 0xc223000, 0x66d8 },
++	{ 0xc22b000, 0x4ad0 },
++	{ 0xc233000, 0x66d8 },
++	{ 0xc23b000, 0x66d8 },
++	{ 0xc243000, 0x66d8 },
++	{ 0xc24b000, 0x66d8 },
++	{ 0xc253000, 0x66d8 },
++	{ 0xc25b000, 0x66d8 },
++	{ 0xc263000, 0x66d8 },
++	{ 0xc26b000, 0x66d8 },
++	{ 0xc273000, 0x66d8 },
++	{ 0xc27b000, 0x66d8 },
++	{ 0xc283000, 0x66d8 },
++	{ 0xc28b000, 0x66d8 },
++	{ 0xc293000, 0x66d8 },
++	{ 0xc29b000, 0x66d8 },
++	{ 0xc2a3000, 0x66d8 },
++	{ 0xc2ab000, 0x66d8 },
++	{ 0xc2b3000, 0x66d8 },
++	{ 0xc2bb000, 0x66d8 },
++	{ 0xc2c3000, 0x66d8 },
++	{ 0xc2cb000, 0x66d8 },
++	{ 0xc2d3000, 0x66d8 },
++	{ 0xc2db000, 0x66d8 },
++	{ 0xc2e3000, 0x66d8 },
++	{ 0xc2eb000, 0x66d8 },
++	{ 0xc2f3000, 0x66d8 },
++	{ 0xc2fb000, 0x66d8 },
++	{ 0xc303000, 0x66d8 },
++	{ 0xc30b000, 0x66d8 },
++	{ 0xc313000, 0x66d8 },
++	{ 0xc31b000, 0x66d8 },
++	{ 0xc323000, 0x66d8 },
++	{ 0xc32b000, 0x66d8 },
++	{ 0xc333000, 0x66d8 },
++	{ 0xc33b000, 0x66d8 },
++	{ 0xe0f000, 0x134 },
++	{ 0xe13000, 0x1b28 },
++	{ 0xe17000, 0x883c },
++	{ 0xe23000, 0x91 },
++	{ 0xe27000, 0x2b0 },
++	{ 0xe2b000, 0x14c },
++	{ 0xe2f000, 0x98 },
++	{ 0xe33000, 0x1b50 },
++	{ 0xe37000, 0x1c5c },
++	{ 0xe3b000, 0x134 },
++	{ 0xe3f000, 0x1b28 },
++	{ 0xe43000, 0x3218c },
++	{ 0xe77000, 0x97 },
++	{ 0xe7b000, 0xe66e0 },
++	{ 0xf63000, 0x2a0 },
++	{ 0xf67000, 0x98 },
++	{ 0xf6b000, 0x6371 },
++	{ 0xf73000, 0x1c5c },
++	{ 0xf77000, 0x1b4 },
++	{ 0xf7b000, 0x1be8 },
++	{ 0xf7f000, 0x37b34 },
++	{ 0xfb7000, 0x1975c },
++	{ 0xfd3000, 0x4b0 },
++	{ 0xfd7000, 0x29bdc4 },
++	{ 0x1273000, 0xbdd4 },
++	{ 0x127f000, 0x5f84d0 },
++	{ 0x187b000, 0xd694 },
++	{ 0x188b000, 0x1d9c },
++	{ 0x27000, 0x193 },
++	{ 0x188f000, 0xf4 },
++	{ 0x1893000, 0x4e10 },
++	{ 0x189b000, 0x54054 },
++	{ 0x18f3000, 0xac8 },
++	{ 0x18f7000, 0x90 },
++	{ 0x18fb000, 0x5bde },
++	{ 0x1903000, 0x4f04 },
++	{ 0x190b000, 0x190 },
++	{ 0x190f000, 0x4e10 },
++	{ 0x1917000, 0x6d100 },
++	{ 0x1987000, 0x12b0 },
++	{ 0x198b000, 0x120 },
++	{ 0x198f000, 0x7e6e },
++	{ 0x1997000, 0x4fa0 },
++	{ 0xbc8b000, 0xf0 },
++	{ 0xbc8f000, 0x170 },
++	{ 0xbc93000, 0x14 },
++	{ 0xbc97000, 0x4 },
++	{ 0xbc9b000, 0x18 },
++	{ 0xbc9f000, 0x14 },
++	{ 0xbca3000, 0x8 },
++	{ 0xbca7000, 0x8 },
++	{ 0xbcab000, 0x8 },
++	{ 0xbcaf000, 0x29000 },
++	{ 0xbcdb000, 0x240c0 },
++	{ 0xbd03000, 0x2eb0 },
++	{ 0xbd07000, 0x2d4 },
++	{ 0xbd0b000, 0xf0 },
++	{ 0xbd0f000, 0x170 },
++	{ 0xbd13000, 0x14 },
++	{ 0xbd17000, 0x4 },
++	{ 0xbd1b000, 0x18 },
++	{ 0xbd1f000, 0x14 },
++	{ 0xbd23000, 0x8 },
++	{ 0xbd27000, 0x8 },
++	{ 0xbd2b000, 0x8 },
++	{ 0xbd2f000, 0x34db0 },
++	{ 0xbd67000, 0x2ccf0 },
++	{ 0xbd97000, 0x11f0 },
++	{ 0xbd9b000, 0x2d4 },
++	{ 0x199f000, 0x200 },
++	{ 0x19a3000, 0x1b28 },
++	{ 0x19a7000, 0x1c7c },
++	{ 0x19ab000, 0xa6 },
++	{ 0x19af000, 0x38e },
++	{ 0x19b3000, 0x150 },
++	{ 0x19b7000, 0x130 },
++	{ 0x19bb000, 0x10b4 },
++	{ 0x19bf000, 0x1d28 },
++	{ 0xbd9f000, 0x8f39c },
++	{ 0x19c3000, 0x200 },
++	{ 0x19c7000, 0x1b28 },
++	{ 0x19cb000, 0x734b },
++	{ 0x19d3000, 0xd9 },
++	{ 0x19d7000, 0xc78 },
++	{ 0x19db000, 0x168 },
++	{ 0x19df000, 0x130 },
++	{ 0x19e3000, 0x1925 },
++	{ 0x19e7000, 0x1d28 },
++	{ 0x19eb000, 0x200 },
++	{ 0x19ef000, 0x1b28 },
++	{ 0x19f3000, 0x591a64 },
++	{ 0x1f87000, 0xb6 },
++	{ 0x1f8b000, 0xcaef0 },
++	{ 0x2057000, 0xbb8 },
++	{ 0x205b000, 0x130 },
++	{ 0x205f000, 0x48594 },
++	{ 0x20ab000, 0x1d28 },
++	{ 0x20af000, 0x134 },
++	{ 0x20b3000, 0x1b28 },
++	{ 0x20b7000, 0x7e3a4 },
++	{ 0x2137000, 0x8e },
++	{ 0x213b000, 0x9198 },
++	{ 0x2147000, 0x1f4 },
++	{ 0x214b000, 0x98 },
++	{ 0x214f000, 0x16b7e },
++	{ 0x2167000, 0x1c5c },
++	{ 0x216b000, 0x134 },
++	{ 0x216f000, 0x1b28 },
++	{ 0x2173000, 0x13f008 },
++	{ 0x22b3000, 0x10f },
++	{ 0x22b7000, 0x103770 },
++	{ 0x23bb000, 0x3e8 },
++	{ 0x23bf000, 0x98 },
++	{ 0x23c3000, 0x1a3f0 },
++	{ 0x23df000, 0x1c5c },
++	{ 0x23e3000, 0x134 },
++	{ 0x23e7000, 0x1b28 },
++	{ 0x23eb000, 0x2f9098 },
++	{ 0x26e7000, 0xa2 },
++	{ 0x26eb000, 0x4715d8 },
++	{ 0x2b5f000, 0x2f4 },
++	{ 0x2b63000, 0x98 },
++	{ 0x2b67000, 0x12e84 },
++	{ 0x2b7b000, 0x1c5c },
++	{ 0x2b7f000, 0x134 },
++	{ 0x2b83000, 0x1b28 },
++	{ 0x2b87000, 0xbca6c },
++	{ 0x2c47000, 0x92 },
++	{ 0x2c4b000, 0xe8280 },
++	{ 0x2d37000, 0x2e8 },
++	{ 0x2d3b000, 0x98 },
++	{ 0x2d3f000, 0xa92d },
++	{ 0x2d4b000, 0x1c5c },
++	{ 0x2d4f000, 0x134 },
++	{ 0x2d53000, 0x1b28 },
++	{ 0x2d57000, 0x3f1c70 },
++	{ 0x314b000, 0x97 },
++	{ 0x314f000, 0x224368 },
++	{ 0x3377000, 0x398 },
++	{ 0x337b000, 0x98 },
++	{ 0x337f000, 0x1568b },
++	{ 0x3397000, 0x1c5c },
++	{ 0x339b000, 0x134 },
++	{ 0x339f000, 0x1b28 },
++	{ 0x33a3000, 0x4bd243 },
++	{ 0x3863000, 0x92 },
++	{ 0x3867000, 0x2a4ea0 },
++	{ 0x3b0f000, 0x340 },
++	{ 0x3b13000, 0x98 },
++	{ 0x3b17000, 0x14f09 },
++	{ 0x3b2f000, 0x1c5c },
++	{ 0x3b33000, 0x134 },
++	{ 0x3b37000, 0x1b28 },
++	{ 0x3b3b000, 0x4187f0 },
++	{ 0x3f57000, 0x97 },
++	{ 0x3f5b000, 0x318ea8 },
++	{ 0x4277000, 0x3a4 },
++	{ 0x427b000, 0x98 },
++	{ 0x427f000, 0x16696 },
++	{ 0x4297000, 0x1c5c },
++	{ 0x429b000, 0x134 },
++	{ 0x429f000, 0x1b28 },
++	{ 0x42a3000, 0x3c0740 },
++	{ 0x4667000, 0x97 },
++	{ 0x466b000, 0x24cc20 },
++	{ 0x48bb000, 0x398 },
++	{ 0x48bf000, 0x98 },
++	{ 0x48c3000, 0x153b5 },
++	{ 0x48db000, 0x1c5c },
++	{ 0x48df000, 0x134 },
++	{ 0x48e3000, 0x1b28 },
++	{ 0x48e7000, 0x134a40 },
++	{ 0x4a1f000, 0x92 },
++	{ 0x4a23000, 0x2f4108 },
++	{ 0x4d1b000, 0x390 },
++	{ 0x4d1f000, 0xa8 },
++	{ 0x4d23000, 0x10e26 },
++	{ 0x4d37000, 0x1c5c },
++	{ 0x4d3b000, 0x134 },
++	{ 0x4d3f000, 0x1b28 },
++	{ 0x4d43000, 0x31f90 },
++	{ 0x4d77000, 0xb6 },
++	{ 0x4d7b000, 0x5158 },
++	{ 0x4d83000, 0x23c },
++	{ 0x4d87000, 0x98 },
++	{ 0x4d8b000, 0x8bc0 },
++	{ 0x4d97000, 0x1c5c },
++	{ 0x4d9b000, 0x134 },
++	{ 0x4d9f000, 0x1b28 },
++	{ 0x4da3000, 0x107f4 },
++	{ 0x4db7000, 0xcd },
++	{ 0x4dbb000, 0x538 },
++	{ 0x4dbf000, 0x204 },
++	{ 0x4dc3000, 0x98 },
++	{ 0x4dc7000, 0x3844 },
++	{ 0x4dcb000, 0x1c5c },
++	{ 0xc34b000, 0x1418 },
++	{ 0x4dcf000, 0x134 },
++	{ 0x4dd3000, 0x1b28 },
++	{ 0x4dd7000, 0x12f44 },
++	{ 0x4deb000, 0xa0 },
++	{ 0x4def000, 0x6c34 },
++	{ 0x4df7000, 0x414 },
++	{ 0x4dfb000, 0x98 },
++	{ 0x4dff000, 0x68e6 },
++	{ 0x4e07000, 0x1c5c },
++	{ 0x4e0b000, 0x200 },
++	{ 0x4e0f000, 0x1b28 },
++	{ 0x4e13000, 0x1efbc },
++	{ 0x4e33000, 0xf0 },
++	{ 0x4e37000, 0x29d8 },
++	{ 0x4e3b000, 0x300 },
++	{ 0x4e3f000, 0x130 },
++	{ 0x4e43000, 0x5fa0 },
++	{ 0xbba3000, 0x2cfa0 },
++	{ 0x4e4b000, 0x1d28 },
++	{ 0x4e4f000, 0x134 },
++	{ 0x4e53000, 0x1b28 },
++	{ 0x4e57000, 0x5650 },
++	{ 0x4e5f000, 0x8b },
++	{ 0x4e63000, 0x1518 },
++	{ 0x4e67000, 0x100 },
++	{ 0x4e6b000, 0x98 },
++	{ 0x4e6f000, 0x1350 },
++	{ 0x4e73000, 0x1c5c },
++	{ 0x4e77000, 0x134 },
++	{ 0x4e7b000, 0x1b28 },
++	{ 0x4e7f000, 0x1425c },
++	{ 0x4e97000, 0xa8 },
++	{ 0x4e9b000, 0x1eb0 },
++	{ 0x4e9f000, 0x130 },
++	{ 0x4ea3000, 0x98 },
++	{ 0x4ea7000, 0x301e },
++	{ 0x4eab000, 0x1c5c },
++	{ 0x4eaf000, 0x134 },
++	{ 0x4eb3000, 0x1b28 },
++	{ 0x4eb7000, 0x4e1c },
++	{ 0x4ebf000, 0x92 },
++	{ 0x4ec3000, 0x228 },
++	{ 0x4ec7000, 0xe0 },
++	{ 0x4ecb000, 0x98 },
++	{ 0x4ecf000, 0xd4a },
++	{ 0x4ed3000, 0x1c5c },
++	{ 0xc343000, 0x66d8 },
++	{ 0x4ed7000, 0x134 },
++	{ 0x4edb000, 0x1b28 },
++	{ 0x4edf000, 0x2c08c },
++	{ 0x4f0f000, 0x89 },
++	{ 0x4f13000, 0xe4a0 },
++	{ 0x4f23000, 0x190 },
++	{ 0x4f27000, 0x98 },
++	{ 0x4f2b000, 0x6adc },
++	{ 0x4f33000, 0x1c5c },
++	{ 0xbc57000, 0x200 },
++	{ 0xbc5b000, 0x1b28 },
++	{ 0xbc5f000, 0x101d5 },
++	{ 0xbc73000, 0xae },
++	{ 0xbc77000, 0x1710 },
++	{ 0xbc7b000, 0x280 },
++	{ 0xbc7f000, 0x130 },
++	{ 0xbc83000, 0x390b },
++	{ 0xbc87000, 0x1d28 },
++	{ 0x4f37000, 0x134 },
++	{ 0x4f3b000, 0x1b28 },
++	{ 0x4f3f000, 0xb6d0 },
++	{ 0x4f4b000, 0x90 },
++	{ 0x4f4f000, 0xa20 },
++	{ 0x4f53000, 0x17c },
++	{ 0x4f57000, 0x98 },
++	{ 0x4f5b000, 0x2539 },
++	{ 0x4f5f000, 0x1c5c },
++	{ 0x4f63000, 0x454 },
++	{ 0x4f67000, 0x1fd8 },
++	{ 0x4f6b000, 0x2020 },
++	{ 0x4f6f000, 0x2150 },
++	{ 0x4f73000, 0x3b6a8 },
++	{ 0x4faf000, 0x42d90 },
++	{ 0x4ff3000, 0xd680 },
++	{ 0x5003000, 0x20488 },
++	{ 0x5027000, 0x1c054 },
++	{ 0x5047000, 0x268e64 },
++	{ 0x52b3000, 0x14c000 },
++	{ 0x53ff000, 0x3e78 },
++	{ 0x5403000, 0x85c0 },
++	{ 0x540f000, 0xd3990 },
++	{ 0x54e3000, 0x4c000 },
++	{ 0x552f000, 0x1e4000 },
++	{ 0x5713000, 0x85c30 },
++	{ 0x579b000, 0x1a61b49 },
++	{ 0x71ff000, 0x4df2dc },
++	{ 0x76df000, 0x44c },
++	{ 0x76e3000, 0x128c0 },
++	{ 0x76f7000, 0x1d1a040 },
++	{ 0x9413000, 0xaf15f },
++	{ 0x94c3000, 0x20000 },
++	{ 0x94e3000, 0x2d },
++	{ 0x94e7000, 0x400000 },
++	{ 0x98e7000, 0x824dc },
++	{ 0x996b000, 0x11da4 },
++	{ 0x997f000, 0x1328 },
++	{ 0x9983000, 0x80 },
++	{ 0x9987000, 0x242c },
++	{ 0xac73000, 0x5aa4 },
++	{ 0xac0f000, 0x4710 },
++	{ 0xac1b000, 0x4100 },
++	{ 0xac27000, 0x33e0 },
++	{ 0xac37000, 0x4fac },
++	{ 0xac43000, 0x4a40 },
++	{ 0xac57000, 0x465c },
++	{ 0xac63000, 0x41dc },
++	{ 0xac7b000, 0x20 },
++	{ 0xac7f000, 0xc80 },
++	{ 0xac87000, 0x855 },
++	{ 0xac8b000, 0x157 },
++	{ 0xac93000, 0x189a },
++	{ 0xacab000, 0xc028 },
++	{ 0xacc7000, 0xb488 },
++	{ 0xacdf000, 0xc09c },
++	{ 0xacf7000, 0xbaa4 },
++	{ 0xad0b000, 0xc498 },
++	{ 0xad23000, 0xeb74 },
++	{ 0xad3b000, 0xefd4 },
++	{ 0xad53000, 0xb744 },
++	{ 0xad6b000, 0xc124 },
++	{ 0xad7f000, 0xac7c },
++	{ 0xad9b000, 0xb968 },
++	{ 0xadaf000, 0xcd48 },
++	{ 0xadc7000, 0xc764 },
++	{ 0xade7000, 0xdd54 },
++	{ 0xadff000, 0x65f8 },
++	{ 0xae0b000, 0xbe80 },
++	{ 0xae1b000, 0x57f8 },
++	{ 0xae27000, 0x65fc },
++	{ 0xae33000, 0xb850 },
++	{ 0xae43000, 0x65f4 },
++	{ 0xae4f000, 0x5890 },
++	{ 0xae5b000, 0x578c },
++	{ 0xae6f000, 0x12448 },
++	{ 0xaeb7000, 0x10edc },
++	{ 0xae8f000, 0xa550 },
++	{ 0xae9f000, 0x10fa8 },
++	{ 0xaed3000, 0x9c00 },
++	{ 0xaee3000, 0xddd0 },
++	{ 0xaef7000, 0xda2c },
++	{ 0xaf0b000, 0x9d50 },
++	{ 0xaf1b000, 0xa1a0 },
++	{ 0xaf2b000, 0x9edc },
++	{ 0xaf3b000, 0xdf74 },
++	{ 0xaf57000, 0x697c },
++	{ 0xaf63000, 0xd03c },
++	{ 0xaf7b000, 0x501c },
++	{ 0xbb07000, 0xb668 },
++	{ 0xbb1b000, 0xc854 },
++	{ 0xbb33000, 0xb5dc },
++	{ 0xbb47000, 0xc028 },
++	{ 0xbb5f000, 0xa738 },
++	{ 0xaf93000, 0xb9e8 },
++	{ 0xafab000, 0xbaac },
++	{ 0xafc3000, 0xc038 },
++	{ 0xafe7000, 0xc1d0 },
++	{ 0xafd7000, 0xbfb8 },
++	{ 0xaffb000, 0xd018 },
++	{ 0xb00f000, 0xbc78 },
++	{ 0xb01f000, 0xb994 },
++	{ 0xb02f000, 0xc6f4 },
++	{ 0xb043000, 0x9da0 },
++	{ 0xb057000, 0x5860 },
++	{ 0xb067000, 0xbc50 },
++	{ 0xb07b000, 0xbcfc },
++	{ 0xb093000, 0xbeb4 },
++	{ 0xb0a3000, 0xc1e8 },
++	{ 0xb0bf000, 0xbe08 },
++	{ 0xb0cf000, 0xb704 },
++	{ 0xb0df000, 0x5780 },
++	{ 0xb0eb000, 0xc150 },
++	{ 0xb0ff000, 0xb958 },
++	{ 0xb10f000, 0x10d80 },
++	{ 0xb12f000, 0xc37c },
++	{ 0xb143000, 0x5f04 },
++	{ 0xb14f000, 0xd74c },
++	{ 0xb163000, 0xbd94 },
++	{ 0xb173000, 0xb310 },
++	{ 0xb183000, 0xc0f8 },
++	{ 0xb19f000, 0xf5ec },
++	{ 0xb1bb000, 0xb8e8 },
++	{ 0xb1d3000, 0xb0fc },
++	{ 0xb1eb000, 0xb9f8 },
++	{ 0xb203000, 0xbd6c },
++	{ 0xb233000, 0xb6a0 },
++	{ 0xb243000, 0xbc88 },
++	{ 0xb25b000, 0xc5c0 },
++	{ 0xb26f000, 0xb504 },
++	{ 0xb27f000, 0xbe6c },
++	{ 0xb28f000, 0xc9c8 },
++	{ 0xb2a3000, 0xb23c },
++	{ 0xb2b7000, 0x3bac },
++	{ 0xb2c7000, 0xb9fc },
++	{ 0xb2d7000, 0xb8fc },
++	{ 0xb2e7000, 0xd784 },
++	{ 0xb2fb000, 0xb4c0 },
++	{ 0xb30b000, 0xb7e4 },
++	{ 0xb31b000, 0xd4c0 },
++	{ 0xb337000, 0xb674 },
++	{ 0xb347000, 0xbb70 },
++	{ 0xb357000, 0xc8ec },
++	{ 0xb36b000, 0xc438 },
++	{ 0xb21b000, 0xa47c },
++	{ 0xb3a3000, 0xb584 },
++	{ 0xb387000, 0xc6c0 },
++	{ 0xb3bb000, 0xc98c },
++	{ 0xb3d7000, 0x9ee4 },
++	{ 0xb3e7000, 0xb59c },
++	{ 0xb3fb000, 0xcc30 },
++	{ 0xb40f000, 0x5fe0 },
++	{ 0xb41f000, 0xb9ac },
++	{ 0xb42f000, 0xc638 },
++	{ 0xb443000, 0xbfb0 },
++	{ 0xb453000, 0xa848 },
++	{ 0xb463000, 0xbd2c },
++	{ 0xb473000, 0xa5b8 },
++	{ 0xb483000, 0xc650 },
++	{ 0xb497000, 0xb9ac },
++	{ 0xb4a7000, 0xa6b0 },
++	{ 0xb4b7000, 0xbc7c },
++	{ 0xb4c7000, 0xc41c },
++	{ 0xb4e3000, 0xd2c8 },
++	{ 0xb4ff000, 0x9808 },
++	{ 0xb513000, 0x9f48 },
++	{ 0xb527000, 0xa1ec },
++	{ 0xb53b000, 0x98d8 },
++	{ 0xb557000, 0xb960 },
++	{ 0xb567000, 0x39a0 },
++	{ 0xb577000, 0xbf34 },
++	{ 0xb58f000, 0xc828 },
++	{ 0xb5a3000, 0xcd34 },
++	{ 0xb5b7000, 0xc8c4 },
++	{ 0xb5d3000, 0x9b88 },
++	{ 0xb5e3000, 0xc03c },
++	{ 0xb5f7000, 0xb9f8 },
++	{ 0xb60f000, 0xb3d4 },
++	{ 0xb62b000, 0xa3b4 },
++	{ 0xb643000, 0xbbd8 },
++	{ 0xb65b000, 0xb870 },
++	{ 0xb673000, 0xb5d4 },
++	{ 0xb68b000, 0xb520 },
++	{ 0xb6a3000, 0xcc14 },
++	{ 0xb6b7000, 0x613c },
++	{ 0xb6c3000, 0xcd58 },
++	{ 0xb6df000, 0xcdb4 },
++	{ 0xb6fb000, 0xb888 },
++	{ 0xb70f000, 0xef38 },
++	{ 0xb723000, 0xeea4 },
++	{ 0xb757000, 0xbc98 },
++	{ 0xb73b000, 0xd0e4 },
++	{ 0xb76b000, 0xa560 },
++	{ 0xb77f000, 0x10ec8 },
++	{ 0xb7a7000, 0x128dc },
++	{ 0xb797000, 0x8e5c },
++	{ 0xb7c7000, 0xc2cc },
++	{ 0xb7f7000, 0xd954 },
++	{ 0xb7e3000, 0x513c },
++	{ 0xb813000, 0xbfa0 },
++	{ 0xb82b000, 0x33dc },
++	{ 0xb83f000, 0xbd30 },
++	{ 0xb857000, 0xbeb4 },
++	{ 0xb86b000, 0xba68 },
++	{ 0xb883000, 0xdefc },
++	{ 0xb89f000, 0xb4c8 },
++	{ 0xb8b7000, 0xb0a0 },
++	{ 0xb8cb000, 0xbddc },
++	{ 0xb8e3000, 0xbf60 },
++	{ 0xb8fb000, 0xb1ac },
++	{ 0xb90f000, 0xd438 },
++	{ 0xb92b000, 0xadf0 },
++	{ 0xb943000, 0xcbd0 },
++	{ 0xb95f000, 0xbbec },
++	{ 0xb977000, 0xba60 },
++	{ 0xb98f000, 0xba00 },
++	{ 0xb9a7000, 0xba40 },
++	{ 0xb9eb000, 0xc1a8 },
++	{ 0xb9db000, 0xc894 },
++	{ 0xb9bf000, 0xc3e4 },
++	{ 0xba07000, 0x9bbc },
++	{ 0xba47000, 0xc140 },
++	{ 0xba5f000, 0x11878 },
++	{ 0xba1b000, 0xb730 },
++	{ 0xba7f000, 0xbb70 },
++	{ 0xba33000, 0xaa08 },
++	{ 0xba97000, 0xc2c8 },
++	{ 0xbab3000, 0xbd4c },
++	{ 0xbac7000, 0xd428 },
++	{ 0xbadf000, 0x16f58 },
++	{ 0xbb6b000, 0x20 },
++	{ 0xbb6f000, 0x2413 },
++	{ 0xbb73000, 0x1d81 },
++	{ 0xbb77000, 0x196f },
++	{ 0xbb7b000, 0x1877 },
++	{ 0xbb7f000, 0x1879 },
++	{ 0xabe3000, 0x2cf },
++	{ 0xc20f000, 0x2c9 },
++	{ 0xbb83000, 0xd4 },
++	{ 0xbb87000, 0x1a98 },
++	{ 0xbb8b000, 0x9738 },
++	{ 0xbb97000, 0x1e74 },
++	{ 0xbb9f000, 0x1b6c },
++	{ 0x998b000, 0x134 },
++	{ 0x998f000, 0x1b28 },
++	{ 0x9993000, 0x4f9a0 },
++	{ 0x99e3000, 0x8f },
++	{ 0x99e7000, 0x3b94 },
++	{ 0x99eb000, 0x238 },
++	{ 0x99ef000, 0x98 },
++	{ 0x99f3000, 0xc861 },
++	{ 0x9a03000, 0x1c5c },
++	{ 0xa6bb000, 0x524817 },
++	{ 0xbbd3000, 0x4a59f },
++	{ 0x9a07000, 0x134 },
++	{ 0x9a0b000, 0x1b28 },
++	{ 0x9a0f000, 0x5bac },
++	{ 0x9a17000, 0x8f },
++	{ 0x9a1b000, 0x4e8 },
++	{ 0x9a1f000, 0xe4 },
++	{ 0x9a23000, 0x98 },
++	{ 0x9a27000, 0x121a },
++	{ 0x9a2b000, 0x1c5c },
++	{ 0x9a2f000, 0x200 },
++	{ 0x9a33000, 0x1b28 },
++	{ 0x9a37000, 0x11ce9 },
++	{ 0x9a4b000, 0xaf },
++	{ 0x9a4f000, 0x25d8 },
++	{ 0x9a53000, 0x210 },
++	{ 0x9a57000, 0x130 },
++	{ 0x9a5b000, 0x277c },
++	{ 0x9a5f000, 0x1d28 },
++	{ 0x9a63000, 0x2f4 },
++	{ 0x9a67000, 0x1dc8 },
++	{ 0x9a6b000, 0x271c },
++	{ 0x9a6f000, 0x2940c },
++	{ 0x9a9b000, 0x1f9290 },
++	{ 0x9c97000, 0x130bf4 },
++	{ 0x9dcb000, 0x2bad4 },
++	{ 0x9df7000, 0x16f8c },
++	{ 0x9e0f000, 0xe081 },
++	{ 0x9e1f000, 0x52 },
++	{ 0x9e23000, 0x7240 },
++	{ 0x9e2b000, 0x3c000 },
++	{ 0x9e67000, 0x13bec1 },
++	{ 0x9fa3000, 0x69244 },
++	{ 0xa00f000, 0x433d0 },
++	{ 0xa053000, 0x8004 },
++	{ 0xa05f000, 0xf5a8 },
++	{ 0xa06f000, 0xcf9c },
++	{ 0xa07f000, 0x6c72c },
++	{ 0xa0ef000, 0x508c4 },
++	{ 0xa143000, 0xec },
++	{ 0xa147000, 0x20bc },
++	{ 0xbc4f000, 0x193 },
++	{ 0xbc53000, 0x195 },
++	{ 0xa14b000, 0x134 },
++	{ 0xa14f000, 0x1b28 },
++	{ 0xa153000, 0x3f534 },
++	{ 0xa193000, 0xc2 },
++	{ 0xa197000, 0x153a04 },
++	{ 0xa2eb000, 0x51c },
++	{ 0xa2ef000, 0x98 },
++	{ 0xa2f3000, 0x8bcb },
++	{ 0xa2ff000, 0x1c5c },
++	{ 0xa303000, 0x200 },
++	{ 0xa307000, 0x1b28 },
++	{ 0xa30b000, 0x4b7aa },
++	{ 0xa357000, 0xec },
++	{ 0xa35b000, 0x154af8 },
++	{ 0xa4b3000, 0xa38 },
++	{ 0xa4b7000, 0x130 },
++	{ 0xa4bb000, 0xdb19 },
++	{ 0xa4cb000, 0x1d28 },
++	{ 0xa4cf000, 0x200 },
++	{ 0xa4d3000, 0x1b28 },
++	{ 0xa4d7000, 0xcd36 },
++	{ 0xa4e7000, 0xb5 },
++	{ 0xa4eb000, 0x918 },
++	{ 0xa4ef000, 0x288 },
++	{ 0xa4f3000, 0x130 },
++	{ 0xa4f7000, 0x1b73 },
++	{ 0xa4fb000, 0x1d28 },
++	{ 0xa4ff000, 0x134 },
++	{ 0xa503000, 0x1b28 },
++	{ 0xa507000, 0x4264 },
++	{ 0xa50f000, 0x81 },
++	{ 0xa513000, 0x2ec },
++	{ 0xa517000, 0xd4 },
++	{ 0xa51b000, 0x98 },
++	{ 0xa51f000, 0xedc },
++	{ 0xa523000, 0x1c5c },
++	{ 0xa527000, 0xd4 },
++	{ 0xa52b000, 0x1a98 },
++	{ 0xa52f000, 0x103118 },
++	{ 0xa633000, 0x9e44 },
++	{ 0xa63f000, 0x20 },
++	{ 0xa643000, 0x1b6c },
++	{ 0xa647000, 0x134 },
++	{ 0xa64b000, 0x1b28 },
++	{ 0xa64f000, 0x1c218 },
++	{ 0xa66f000, 0x85 },
++	{ 0xa673000, 0x57d4 },
++	{ 0xa67b000, 0x19c },
++	{ 0xa67f000, 0x98 },
++	{ 0xa683000, 0x8216 },
++	{ 0xa68f000, 0x1c5c },
++	{ 0xa693000, 0x134 },
++	{ 0xa697000, 0x1b28 },
++	{ 0xa69b000, 0x7ce4 },
++	{ 0xa6a3000, 0xb2 },
++	{ 0xa6a7000, 0x3bc },
++	{ 0xa6ab000, 0x10c },
++	{ 0xa6af000, 0x98 },
++	{ 0xa6b3000, 0x1533 },
++	{ 0xa6b7000, 0x1c5c },
++	{ 0xbc1f000, 0x2d2e8 },
++	{ 0xbe2f000, 0x3ddddc },
++};
++static const struct fw_entry fw_all_vayu[] = {
++	{ "image/adsp.b00", 0x214, 0, 1 },
++	{ "image/adsp.b01", 0x1c78, 1, 1 },
++	{ "image/adsp.b02", 0x221c, 2, 1 },
++	{ "image/adsp.b03", 0x32fe8, 3, 1 },
++	{ "image/adsp.b04", 0x1b9808, 4, 1 },
++	{ "image/adsp.b05", 0xdaac4, 5, 1 },
++	{ "image/adsp.b06", 0xb80, 6, 1 },
++	{ "image/adsp.b07", 0xb318, 7, 1 },
++	{ "image/adsp.b08", 0x85780, 8, 1 },
++	{ "image/adsp.b09", 0x6c, 9, 1 },
++	{ "image/adsp.b10", 0x9502b0, 10, 1 },
++	{ "image/adsp.b11", 0x858d0, 11, 1 },
++	{ "image/adsp.b12", 0xf80, 12, 1 },
++	{ "image/adsp.b13", 0x8a28c, 13, 1 },
++	{ "image/adsp.mdt", 0x1e8c, 14, 1 },
++	{ "image/adspr.jsn", 0x193, 15, 1 },
++	{ "image/adspua.jsn", 0x22b, 16, 1 },
++	{ "image/bd_f11cn.bin", 0x66d8, 17, 1 },
++	{ "image/bd_f11gl.bin", 0x66d8, 18, 1 },
++	{ "image/bd_j20s.bin", 0x66d8, 19, 1 },
++	{ "image/bdf_f10.bin", 0x4ad0, 20, 1 },
++	{ "image/bdwlan.102", 0x66d8, 21, 1 },
++	{ "image/bdwlan.104", 0x66d8, 22, 1 },
++	{ "image/bdwlan.105", 0x66d8, 23, 1 },
++	{ "image/bdwlan.106", 0x66d8, 24, 1 },
++	{ "image/bdwlan.107", 0x66d8, 25, 1 },
++	{ "image/bdwlan.108", 0x66d8, 26, 1 },
++	{ "image/bdwlan.109", 0x66d8, 27, 1 },
++	{ "image/bdwlan.b04", 0x66d8, 28, 1 },
++	{ "image/bdwlan.b07", 0x66d8, 29, 1 },
++	{ "image/bdwlan.b09", 0x66d8, 30, 1 },
++	{ "image/bdwlan.b0a", 0x66d8, 31, 1 },
++	{ "image/bdwlan.b0b", 0x66d8, 32, 1 },
++	{ "image/bdwlan.b0d", 0x66d8, 33, 1 },
++	{ "image/bdwlan.b0e", 0x66d8, 34, 1 },
++	{ "image/bdwlan.b0f", 0x66d8, 35, 1 },
++	{ "image/bdwlan.b14", 0x66d8, 36, 1 },
++	{ "image/bdwlan.b15", 0x66d8, 37, 1 },
++	{ "image/bdwlan.b30", 0x66d8, 38, 1 },
++	{ "image/bdwlan.b31", 0x66d8, 39, 1 },
++	{ "image/bdwlan.b32", 0x66d8, 40, 1 },
++	{ "image/bdwlan.b33", 0x66d8, 41, 1 },
++	{ "image/bdwlan.b34", 0x66d8, 42, 1 },
++	{ "image/bdwlan.b35", 0x66d8, 43, 1 },
++	{ "image/bdwlan.b36", 0x66d8, 44, 1 },
++	{ "image/bdwlan.b37", 0x66d8, 45, 1 },
++	{ "image/bdwlan.b38", 0x66d8, 46, 1 },
++	{ "image/bdwlan.b3d", 0x66d8, 47, 1 },
++	{ "image/bdwlan.b3f", 0x66d8, 48, 1 },
++	{ "image/bdwlan.b44", 0x66d8, 49, 1 },
++	{ "image/bdwlan.b46", 0x66d8, 50, 1 },
++	{ "image/bdwlan.b48", 0x66d8, 51, 1 },
++	{ "image/bdwlan.b55", 0x66d8, 52, 1 },
++	{ "image/bdwlan.b71", 0x66d8, 53, 1 },
++	{ "image/bdwlan.bin", 0x66d8, 54, 1 },
++	{ "image/cardapp.b00", 0x134, 55, 1 },
++	{ "image/cardapp.b01", 0x1b28, 56, 1 },
++	{ "image/cardapp.b02", 0x883c, 57, 1 },
++	{ "image/cardapp.b03", 0x91, 58, 1 },
++	{ "image/cardapp.b04", 0x2b0, 59, 1 },
++	{ "image/cardapp.b05", 0x14c, 60, 1 },
++	{ "image/cardapp.b06", 0x98, 61, 1 },
++	{ "image/cardapp.b07", 0x1b50, 62, 1 },
++	{ "image/cardapp.mdt", 0x1c5c, 63, 1 },
++	{ "image/cdcvmpin.b00", 0x134, 64, 1 },
++	{ "image/cdcvmpin.b01", 0x1b28, 65, 1 },
++	{ "image/cdcvmpin.b02", 0x3218c, 66, 1 },
++	{ "image/cdcvmpin.b03", 0x97, 67, 1 },
++	{ "image/cdcvmpin.b04", 0xe66e0, 68, 1 },
++	{ "image/cdcvmpin.b05", 0x2a0, 69, 1 },
++	{ "image/cdcvmpin.b06", 0x98, 70, 1 },
++	{ "image/cdcvmpin.b07", 0x6371, 71, 1 },
++	{ "image/cdcvmpin.mdt", 0x1c5c, 72, 1 },
++	{ "image/cdsp.b00", 0x1b4, 73, 1 },
++	{ "image/cdsp.b01", 0x1be8, 74, 1 },
++	{ "image/cdsp.b02", 0x37b34, 75, 1 },
++	{ "image/cdsp.b03", 0x1975c, 76, 1 },
++	{ "image/cdsp.b04", 0x4b0, 77, 1 },
++	{ "image/cdsp.b05", 0x29bdc4, 78, 1 },
++	{ "image/cdsp.b06", 0xbdd4, 79, 1 },
++	{ "image/cdsp.b08", 0x5f84d0, 80, 1 },
++	{ "image/cdsp.b10", 0xd694, 81, 1 },
++	{ "image/cdsp.mdt", 0x1d9c, 82, 1 },
++	{ "image/cdspr.jsn", 0x193, 83, 1 },
++	{ "image/cmnlib.b00", 0xf4, 84, 1 },
++	{ "image/cmnlib.b01", 0x4e10, 85, 1 },
++	{ "image/cmnlib.b02", 0x54054, 86, 1 },
++	{ "image/cmnlib.b03", 0xac8, 87, 1 },
++	{ "image/cmnlib.b04", 0x90, 88, 1 },
++	{ "image/cmnlib.b05", 0x5bde, 89, 1 },
++	{ "image/cmnlib.mdt", 0x4f04, 90, 1 },
++	{ "image/cmnlib64.b00", 0x190, 91, 1 },
++	{ "image/cmnlib64.b01", 0x4e10, 92, 1 },
++	{ "image/cmnlib64.b02", 0x6d100, 93, 1 },
++	{ "image/cmnlib64.b03", 0x12b0, 94, 1 },
++	{ "image/cmnlib64.b04", 0x120, 95, 1 },
++	{ "image/cmnlib64.b05", 0x7e6e, 96, 1 },
++	{ "image/cmnlib64.mdt", 0x4fa0, 97, 1 },
++	{ "image/cpe_9340.b01", 0xf0, 98, 1 },
++	{ "image/cpe_9340.b03", 0x170, 99, 1 },
++	{ "image/cpe_9340.b05", 0x14, 100, 1 },
++	{ "image/cpe_9340.b06", 0x4, 101, 1 },
++	{ "image/cpe_9340.b07", 0x18, 102, 1 },
++	{ "image/cpe_9340.b09", 0x14, 103, 1 },
++	{ "image/cpe_9340.b11", 0x8, 104, 1 },
++	{ "image/cpe_9340.b13", 0x8, 105, 1 },
++	{ "image/cpe_9340.b15", 0x8, 106, 1 },
++	{ "image/cpe_9340.b16", 0x29000, 107, 1 },
++	{ "image/cpe_9340.b18", 0x240c0, 108, 1 },
++	{ "image/cpe_9340.b20", 0x2eb0, 109, 1 },
++	{ "image/cpe_9340.mdt", 0x2d4, 110, 1 },
++	{ "image/cpe_intl.b01", 0xf0, 111, 1 },
++	{ "image/cpe_intl.b03", 0x170, 112, 1 },
++	{ "image/cpe_intl.b05", 0x14, 113, 1 },
++	{ "image/cpe_intl.b06", 0x4, 114, 1 },
++	{ "image/cpe_intl.b07", 0x18, 115, 1 },
++	{ "image/cpe_intl.b09", 0x14, 116, 1 },
++	{ "image/cpe_intl.b11", 0x8, 117, 1 },
++	{ "image/cpe_intl.b13", 0x8, 118, 1 },
++	{ "image/cpe_intl.b15", 0x8, 119, 1 },
++	{ "image/cpe_intl.b16", 0x34db0, 120, 1 },
++	{ "image/cpe_intl.b18", 0x2ccf0, 121, 1 },
++	{ "image/cpe_intl.b20", 0x11f0, 122, 1 },
++	{ "image/cpe_intl.mdt", 0x2d4, 123, 1 },
++	{ "image/cppf.b00", 0x200, 124, 1 },
++	{ "image/cppf.b01", 0x1b28, 125, 1 },
++	{ "image/cppf.b02", 0x1c7c, 126, 1 },
++	{ "image/cppf.b03", 0xa6, 127, 1 },
++	{ "image/cppf.b04", 0x38e, 128, 1 },
++	{ "image/cppf.b05", 0x150, 129, 1 },
++	{ "image/cppf.b06", 0x130, 130, 1 },
++	{ "image/cppf.b07", 0x10b4, 131, 1 },
++	{ "image/cppf.mdt", 0x1d28, 132, 1 },
++	{ "image/data.msc", 0x8f39c, 133, 1 },
++	{ "image/eseservi.b00", 0x200, 134, 1 },
++	{ "image/eseservi.b01", 0x1b28, 135, 1 },
++	{ "image/eseservi.b02", 0x734b, 136, 1 },
++	{ "image/eseservi.b03", 0xd9, 137, 1 },
++	{ "image/eseservi.b04", 0xc78, 138, 1 },
++	{ "image/eseservi.b05", 0x168, 139, 1 },
++	{ "image/eseservi.b06", 0x130, 140, 1 },
++	{ "image/eseservi.b07", 0x1925, 141, 1 },
++	{ "image/eseservi.mdt", 0x1d28, 142, 1 },
++	{ "image/fingerpr.b00", 0x200, 143, 1 },
++	{ "image/fingerpr.b01", 0x1b28, 144, 1 },
++	{ "image/fingerpr.b02", 0x591a64, 145, 1 },
++	{ "image/fingerpr.b03", 0xb6, 146, 1 },
++	{ "image/fingerpr.b04", 0xcaef0, 147, 1 },
++	{ "image/fingerpr.b05", 0xbb8, 148, 1 },
++	{ "image/fingerpr.b06", 0x130, 149, 1 },
++	{ "image/fingerpr.b07", 0x48594, 150, 1 },
++	{ "image/fingerpr.mdt", 0x1d28, 151, 1 },
++	{ "image/fpcdav.b00", 0x134, 152, 1 },
++	{ "image/fpcdav.b01", 0x1b28, 153, 1 },
++	{ "image/fpcdav.b02", 0x7e3a4, 154, 1 },
++	{ "image/fpcdav.b03", 0x8e, 155, 1 },
++	{ "image/fpcdav.b04", 0x9198, 156, 1 },
++	{ "image/fpcdav.b05", 0x1f4, 157, 1 },
++	{ "image/fpcdav.b06", 0x98, 158, 1 },
++	{ "image/fpcdav.b07", 0x16b7e, 159, 1 },
++	{ "image/fpcdav.mdt", 0x1c5c, 160, 1 },
++	{ "image/fpcvayu.b00", 0x134, 161, 1 },
++	{ "image/fpcvayu.b01", 0x1b28, 162, 1 },
++	{ "image/fpcvayu.b02", 0x13f008, 163, 1 },
++	{ "image/fpcvayu.b03", 0x10f, 164, 1 },
++	{ "image/fpcvayu.b04", 0x103770, 165, 1 },
++	{ "image/fpcvayu.b05", 0x3e8, 166, 1 },
++	{ "image/fpcvayu.b06", 0x98, 167, 1 },
++	{ "image/fpcvayu.b07", 0x1a3f0, 168, 1 },
++	{ "image/fpcvayu.mdt", 0x1c5c, 169, 1 },
++	{ "image/gfcep.b00", 0x134, 170, 1 },
++	{ "image/gfcep.b01", 0x1b28, 171, 1 },
++	{ "image/gfcep.b02", 0x2f9098, 172, 1 },
++	{ "image/gfcep.b03", 0xa2, 173, 1 },
++	{ "image/gfcep.b04", 0x4715d8, 174, 1 },
++	{ "image/gfcep.b05", 0x2f4, 175, 1 },
++	{ "image/gfcep.b06", 0x98, 176, 1 },
++	{ "image/gfcep.b07", 0x12e84, 177, 1 },
++	{ "image/gfcep.mdt", 0x1c5c, 178, 1 },
++	{ "image/gfdav.b00", 0x134, 179, 1 },
++	{ "image/gfdav.b01", 0x1b28, 180, 1 },
++	{ "image/gfdav.b02", 0xbca6c, 181, 1 },
++	{ "image/gfdav.b03", 0x92, 182, 1 },
++	{ "image/gfdav.b04", 0xe8280, 183, 1 },
++	{ "image/gfdav.b05", 0x2e8, 184, 1 },
++	{ "image/gfdav.b06", 0x98, 185, 1 },
++	{ "image/gfdav.b07", 0xa92d, 186, 1 },
++	{ "image/gfdav.mdt", 0x1c5c, 187, 1 },
++	{ "image/gfdrc.b00", 0x134, 188, 1 },
++	{ "image/gfdrc.b01", 0x1b28, 189, 1 },
++	{ "image/gfdrc.b02", 0x3f1c70, 190, 1 },
++	{ "image/gfdrc.b03", 0x97, 191, 1 },
++	{ "image/gfdrc.b04", 0x224368, 192, 1 },
++	{ "image/gfdrc.b05", 0x398, 193, 1 },
++	{ "image/gfdrc.b06", 0x98, 194, 1 },
++	{ "image/gfdrc.b07", 0x1568b, 195, 1 },
++	{ "image/gfdrc.mdt", 0x1c5c, 196, 1 },
++	{ "image/gforion.b00", 0x134, 197, 1 },
++	{ "image/gforion.b01", 0x1b28, 198, 1 },
++	{ "image/gforion.b02", 0x4bd243, 199, 1 },
++	{ "image/gforion.b03", 0x92, 200, 1 },
++	{ "image/gforion.b04", 0x2a4ea0, 201, 1 },
++	{ "image/gforion.b05", 0x340, 202, 1 },
++	{ "image/gforion.b06", 0x98, 203, 1 },
++	{ "image/gforion.b07", 0x14f09, 204, 1 },
++	{ "image/gforion.mdt", 0x1c5c, 205, 1 },
++	{ "image/gfpavo.b00", 0x134, 206, 1 },
++	{ "image/gfpavo.b01", 0x1b28, 207, 1 },
++	{ "image/gfpavo.b02", 0x4187f0, 208, 1 },
++	{ "image/gfpavo.b03", 0x97, 209, 1 },
++	{ "image/gfpavo.b04", 0x318ea8, 210, 1 },
++	{ "image/gfpavo.b05", 0x3a4, 211, 1 },
++	{ "image/gfpavo.b06", 0x98, 212, 1 },
++	{ "image/gfpavo.b07", 0x16696, 213, 1 },
++	{ "image/gfpavo.mdt", 0x1c5c, 214, 1 },
++	{ "image/gfraph.b00", 0x134, 215, 1 },
++	{ "image/gfraph.b01", 0x1b28, 216, 1 },
++	{ "image/gfraph.b02", 0x3c0740, 217, 1 },
++	{ "image/gfraph.b03", 0x97, 218, 1 },
++	{ "image/gfraph.b04", 0x24cc20, 219, 1 },
++	{ "image/gfraph.b05", 0x398, 220, 1 },
++	{ "image/gfraph.b06", 0x98, 221, 1 },
++	{ "image/gfraph.b07", 0x153b5, 222, 1 },
++	{ "image/gfraph.mdt", 0x1c5c, 223, 1 },
++	{ "image/gfvayu.b00", 0x134, 224, 1 },
++	{ "image/gfvayu.b01", 0x1b28, 225, 1 },
++	{ "image/gfvayu.b02", 0x134a40, 226, 1 },
++	{ "image/gfvayu.b03", 0x92, 227, 1 },
++	{ "image/gfvayu.b04", 0x2f4108, 228, 1 },
++	{ "image/gfvayu.b05", 0x390, 229, 1 },
++	{ "image/gfvayu.b06", 0xa8, 230, 1 },
++	{ "image/gfvayu.b07", 0x10e26, 231, 1 },
++	{ "image/gfvayu.mdt", 0x1c5c, 232, 1 },
++	{ "image/gpeid.b00", 0x134, 233, 1 },
++	{ "image/gpeid.b01", 0x1b28, 234, 1 },
++	{ "image/gpeid.b02", 0x31f90, 235, 1 },
++	{ "image/gpeid.b03", 0xb6, 236, 1 },
++	{ "image/gpeid.b04", 0x5158, 237, 1 },
++	{ "image/gpeid.b05", 0x23c, 238, 1 },
++	{ "image/gpeid.b06", 0x98, 239, 1 },
++	{ "image/gpeid.b07", 0x8bc0, 240, 1 },
++	{ "image/gpeid.mdt", 0x1c5c, 241, 1 },
++	{ "image/gpqese.b00", 0x134, 242, 1 },
++	{ "image/gpqese.b01", 0x1b28, 243, 1 },
++	{ "image/gpqese.b02", 0x107f4, 244, 1 },
++	{ "image/gpqese.b03", 0xcd, 245, 1 },
++	{ "image/gpqese.b04", 0x538, 246, 1 },
++	{ "image/gpqese.b05", 0x204, 247, 1 },
++	{ "image/gpqese.b06", 0x98, 248, 1 },
++	{ "image/gpqese.b07", 0x3844, 249, 1 },
++	{ "image/gpqese.mdt", 0x1c5c, 250, 1 },
++	{ "image/gptauuid.xml", 0x1418, 251, 1 },
++	{ "image/gptest.b00", 0x134, 252, 1 },
++	{ "image/gptest.b01", 0x1b28, 253, 1 },
++	{ "image/gptest.b02", 0x12f44, 254, 1 },
++	{ "image/gptest.b03", 0xa0, 255, 1 },
++	{ "image/gptest.b04", 0x6c34, 256, 1 },
++	{ "image/gptest.b05", 0x414, 257, 1 },
++	{ "image/gptest.b06", 0x98, 258, 1 },
++	{ "image/gptest.b07", 0x68e6, 259, 1 },
++	{ "image/gptest.mdt", 0x1c5c, 260, 1 },
++	{ "image/haventkn.b00", 0x200, 261, 1 },
++	{ "image/haventkn.b01", 0x1b28, 262, 1 },
++	{ "image/haventkn.b02", 0x1efbc, 263, 1 },
++	{ "image/haventkn.b03", 0xf0, 264, 1 },
++	{ "image/haventkn.b04", 0x29d8, 265, 1 },
++	{ "image/haventkn.b05", 0x300, 266, 1 },
++	{ "image/haventkn.b06", 0x130, 267, 1 },
++	{ "image/haventkn.b07", 0x5fa0, 268, 1 },
++	{ "image/haventkn.mbn", 0x2cfa0, 269, 1 },
++	{ "image/haventkn.mdt", 0x1d28, 270, 1 },
++	{ "image/hdcp1.b00", 0x134, 271, 1 },
++	{ "image/hdcp1.b01", 0x1b28, 272, 1 },
++	{ "image/hdcp1.b02", 0x5650, 273, 1 },
++	{ "image/hdcp1.b03", 0x8b, 274, 1 },
++	{ "image/hdcp1.b04", 0x1518, 275, 1 },
++	{ "image/hdcp1.b05", 0x100, 276, 1 },
++	{ "image/hdcp1.b06", 0x98, 277, 1 },
++	{ "image/hdcp1.b07", 0x1350, 278, 1 },
++	{ "image/hdcp1.mdt", 0x1c5c, 279, 1 },
++	{ "image/hdcp2p2.b00", 0x134, 280, 1 },
++	{ "image/hdcp2p2.b01", 0x1b28, 281, 1 },
++	{ "image/hdcp2p2.b02", 0x1425c, 282, 1 },
++	{ "image/hdcp2p2.b03", 0xa8, 283, 1 },
++	{ "image/hdcp2p2.b04", 0x1eb0, 284, 1 },
++	{ "image/hdcp2p2.b05", 0x130, 285, 1 },
++	{ "image/hdcp2p2.b06", 0x98, 286, 1 },
++	{ "image/hdcp2p2.b07", 0x301e, 287, 1 },
++	{ "image/hdcp2p2.mdt", 0x1c5c, 288, 1 },
++	{ "image/hdcpsrm.b00", 0x134, 289, 1 },
++	{ "image/hdcpsrm.b01", 0x1b28, 290, 1 },
++	{ "image/hdcpsrm.b02", 0x4e1c, 291, 1 },
++	{ "image/hdcpsrm.b03", 0x92, 292, 1 },
++	{ "image/hdcpsrm.b04", 0x228, 293, 1 },
++	{ "image/hdcpsrm.b05", 0xe0, 294, 1 },
++	{ "image/hdcpsrm.b06", 0x98, 295, 1 },
++	{ "image/hdcpsrm.b07", 0xd4a, 296, 1 },
++	{ "image/hdcpsrm.mdt", 0x1c5c, 297, 1 },
++	{ "image/j20s_in.bin", 0x66d8, 298, 1 },
++	{ "image/mfido.b00", 0x134, 299, 1 },
++	{ "image/mfido.b01", 0x1b28, 300, 1 },
++	{ "image/mfido.b02", 0x2c08c, 301, 1 },
++	{ "image/mfido.b03", 0x89, 302, 1 },
++	{ "image/mfido.b04", 0xe4a0, 303, 1 },
++	{ "image/mfido.b05", 0x190, 304, 1 },
++	{ "image/mfido.b06", 0x98, 305, 1 },
++	{ "image/mfido.b07", 0x6adc, 306, 1 },
++	{ "image/mfido.mdt", 0x1c5c, 307, 1 },
++	{ "image/mldapta.b00", 0x200, 308, 1 },
++	{ "image/mldapta.b01", 0x1b28, 309, 1 },
++	{ "image/mldapta.b02", 0x101d5, 310, 1 },
++	{ "image/mldapta.b03", 0xae, 311, 1 },
++	{ "image/mldapta.b04", 0x1710, 312, 1 },
++	{ "image/mldapta.b05", 0x280, 313, 1 },
++	{ "image/mldapta.b06", 0x130, 314, 1 },
++	{ "image/mldapta.b07", 0x390b, 315, 1 },
++	{ "image/mldapta.mdt", 0x1d28, 316, 1 },
++	{ "image/mlipay.b00", 0x134, 317, 1 },
++	{ "image/mlipay.b01", 0x1b28, 318, 1 },
++	{ "image/mlipay.b02", 0xb6d0, 319, 1 },
++	{ "image/mlipay.b03", 0x90, 320, 1 },
++	{ "image/mlipay.b04", 0xa20, 321, 1 },
++	{ "image/mlipay.b05", 0x17c, 322, 1 },
++	{ "image/mlipay.b06", 0x98, 323, 1 },
++	{ "image/mlipay.b07", 0x2539, 324, 1 },
++	{ "image/mlipay.mdt", 0x1c5c, 325, 1 },
++	{ "image/modem.b00", 0x454, 326, 1 },
++	{ "image/modem.b01", 0x1fd8, 327, 1 },
++	{ "image/modem.b02", 0x2020, 328, 1 },
++	{ "image/modem.b03", 0x2150, 329, 1 },
++	{ "image/modem.b04", 0x3b6a8, 330, 1 },
++	{ "image/modem.b05", 0x42d90, 331, 1 },
++	{ "image/modem.b06", 0xd680, 332, 1 },
++	{ "image/modem.b07", 0x20488, 333, 1 },
++	{ "image/modem.b08", 0x1c054, 334, 1 },
++	{ "image/modem.b09", 0x268e64, 335, 1 },
++	{ "image/modem.b10", 0x14c000, 336, 1 },
++	{ "image/modem.b11", 0x3e78, 337, 1 },
++	{ "image/modem.b12", 0x85c0, 338, 1 },
++	{ "image/modem.b13", 0xd3990, 339, 1 },
++	{ "image/modem.b14", 0x4c000, 340, 1 },
++	{ "image/modem.b15", 0x1e4000, 341, 1 },
++	{ "image/modem.b17", 0x85c30, 342, 1 },
++	{ "image/modem.b18", 0x1a61b49, 343, 1 },
++	{ "image/modem.b19", 0x4df2dc, 344, 1 },
++	{ "image/modem.b20", 0x44c, 345, 1 },
++	{ "image/modem.b22", 0x128c0, 346, 1 },
++	{ "image/modem.b23", 0x1d1a040, 347, 1 },
++	{ "image/modem.b24", 0xaf15f, 348, 1 },
++	{ "image/modem.b25", 0x20000, 349, 1 },
++	{ "image/modem.b26", 0x2d, 350, 1 },
++	{ "image/modem.b27", 0x400000, 351, 1 },
++	{ "image/modem.b28", 0x824dc, 352, 1 },
++	{ "image/modem.b29", 0x11da4, 353, 1 },
++	{ "image/modem.b30", 0x1328, 354, 1 },
++	{ "image/modem.b31", 0x80, 355, 1 },
++	{ "image/modem.mdt", 0x242c, 356, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/cmcc_sub/sr_dsds/mcfg_hw.mbn", 0x5aa4, 357, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/la/7+7_mode/sr_dsds/mcfg_hw.mbn", 0x4710, 358, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/la/ss/mcfg_hw.mbn", 0x4100, 359, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/la/ss_apq_o/mcfg_hw.mbn", 0x33e0, 360, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/wd/7+7_mode/sr_dsds/mcfg_hw.mbn", 0x4fac, 361, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/wd/ss/mcfg_hw.mbn", 0x4a40, 362, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/wp8/7+7_mode/sr_dsds/mcfg_hw.mbn", 0x465c, 363, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/sm8150/wp8/ss/mcfg_hw.mbn", 0x41dc, 364, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig", 0x20, 365, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.txt", 0xc80, 366, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/oem_hw.txt", 0x0, 367, 0 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/oem_hw_a.txt", 0x855, 367, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/oem_hw_w.txt", 0x157, 368, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/ct.txt", 0x189a, 369, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/cellc/commerci/safrica/mcfg_sw.mbn", 0xc028, 370, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/moroccot/commerci/ma/mcfg_sw.mbn", 0xb488, 371, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/airtel/commerci/mcfg_sw.mbn", 0xc09c, 372, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/dcm/commerci/mcfg_sw.mbn", 0xbaa4, 373, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/idea/commerci/mcfg_sw.mbn", 0xc498, 374, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/kddi/commerci/mcfg_sw.mbn", 0xeb74, 375, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/reliance/commerci/mcfg_sw.mbn", 0xefd4, 376, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/sbm/commerci/mcfg_sw.mbn", 0xb744, 377, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/vodafone/commerci/india/mcfg_sw.mbn", 0xc124, 378, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/vodafone/commerci/qatar/mcfg_sw.mbn", 0xac7c, 379, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/aunz/optus/commerci/au/mcfg_sw.mbn", 0xb968, 380, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/aunz/telstra/commerci/mcfg_sw.mbn", 0xcd48, 381, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/aunz/vodafone/commerci/mcfg_sw.mbn", 0xc764, 382, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/commerci/volte_op/mcfg_sw.mbn", 0xdd54, 383, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/agnss_lo/mcfg_sw.mbn", 0x65f8, 384, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/conf_vol/mcfg_sw.mbn", 0xbe80, 385, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/eps_only/mcfg_sw.mbn", 0x57f8, 386, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/lpp_loct/mcfg_sw.mbn", 0x65fc, 387, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/nsiot_vo/mcfg_sw.mbn", 0xb850, 388, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/rrlp_loc/mcfg_sw.mbn", 0x65f4, 389, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/tgl_comb/mcfg_sw.mbn", 0x5890, 390, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/w_irat_c/mcfg_sw.mbn", 0x578c, 391, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmhk/commerci/volte_op/mcfg_sw.mbn", 0x12448, 392, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/hvolte_o/mcfg_sw.mbn", 0x10edc, 393, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/openmkt/mcfg_sw.mbn", 0xa550, 394, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/volte_op/mcfg_sw.mbn", 0x10fa8, 395, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/cta/mcfg_sw.mbn", 0x9c00, 396, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/eps_only/mcfg_sw.mbn", 0xddd0, 397, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/noapn_vo/mcfg_sw.mbn", 0xda2c, 398, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/test/mcfg_sw.mbn", 0x9d50, 399, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/test_eps/mcfg_sw.mbn", 0xa1a0, 400, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/test_no_/mcfg_sw.mbn", 0x9edc, 401, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/volte_co/mcfg_sw.mbn", 0xdf74, 402, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/commerci/openmkt/mcfg_sw.mbn", 0x697c, 403, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/commerci/volte/mcfg_sw.mbn", 0xd03c, 404, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/lab/test/mcfg_sw.mbn", 0x501c, 405, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/default/sm8150.p/5g_defau/mcfg_sw.mbn", 0xb668, 406, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/default/sm8150.p/default/mcfg_sw.mbn", 0xc854, 407, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/gcf/lab/mcfg_sw.mbn", 0xb5dc, 408, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/row/commerci/mcfg_sw.mbn", 0xc028, 409, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/w_one/commerci/mcfg_sw.mbn", 0xa738, 410, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/bouygues/commerci/france/mcfg_sw.mbn", 0xb9e8, 411, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/digi/commerci/romania/mcfg_sw.mbn", 0xbaac, 412, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/austria/mcfg_sw.mbn", 0xc038, 413, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/croatia/mcfg_sw.mbn", 0xc1d0, 414, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/cz/mcfg_sw.mbn", 0xbfb8, 415, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/greece/mcfg_sw.mbn", 0xd018, 416, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/hungary/mcfg_sw.mbn", 0xbc78, 417, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/nl/mcfg_sw.mbn", 0xb994, 418, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/pl/mcfg_sw.mbn", 0xc6f4, 419, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/slovakia/mcfg_sw.mbn", 0x9da0, 420, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/non_volt/commerci/mcfg_sw.mbn", 0x5860, 421, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/volte/commerci/mcfg_sw.mbn", 0xbc50, 422, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/ee/commerci/mcfg_sw.mbn", 0xbcfc, 423, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/elisa/commerci/ee/mcfg_sw.mbn", 0xbeb4, 424, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/elisa/commerci/fi/mcfg_sw.mbn", 0xc1e8, 425, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/austria/mcfg_sw.mbn", 0xbe08, 426, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/denmark/mcfg_sw.mbn", 0xb704, 427, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/ireland/mcfg_sw.mbn", 0x5780, 428, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/italy/mcfg_sw.mbn", 0xc150, 429, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/se/mcfg_sw.mbn", 0xb958, 430, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/uk/mcfg_sw.mbn", 0x10d80, 431, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/france/mcfg_sw.mbn", 0xc37c, 432, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/group_no/mcfg_sw.mbn", 0x5f04, 433, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/poland/mcfg_sw.mbn", 0xd74c, 434, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/romania/mcfg_sw.mbn", 0xbd94, 435, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/slovakia/mcfg_sw.mbn", 0xb310, 436, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/spain/mcfg_sw.mbn", 0xc0f8, 437, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/play/commerci/poland/mcfg_sw.mbn", 0xf5ec, 438, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/plus/commerci/poland/mcfg_sw.mbn", 0xb8e8, 439, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/sfr/commerci/fr/mcfg_sw.mbn", 0xb0fc, 440, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/swisscom/commerci/swiss/mcfg_sw.mbn", 0xb9f8, 441, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tdc/commerci/denmark/mcfg_sw.mbn", 0xbd6c, 442, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/nl/mcfg_sw.mbn", 0xb6a0, 443, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/sweden/mcfg_sw.mbn", 0xbc88, 444, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/cz/mcfg_sw.mbn", 0xc5c0, 445, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/de/mcfg_sw.mbn", 0xb504, 446, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/sk/mcfg_sw.mbn", 0xbe6c, 447, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/spain/mcfg_sw.mbn", 0xc9c8, 448, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/uk/mcfg_sw.mbn", 0xb23c, 449, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/non_volt/spain/mcfg_sw.mbn", 0x3bac, 450, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/bulgaria/mcfg_sw.mbn", 0xb9fc, 451, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/denmark/mcfg_sw.mbn", 0xb8fc, 452, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/fi/mcfg_sw.mbn", 0xd784, 453, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/hu/mcfg_sw.mbn", 0xb4c0, 454, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/norway/mcfg_sw.mbn", 0xb7e4, 455, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/se/mcfg_sw.mbn", 0xd4c0, 456, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/fi/mcfg_sw.mbn", 0xb674, 457, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/lithuani/mcfg_sw.mbn", 0xbb70, 458, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/norway/mcfg_sw.mbn", 0xc8ec, 459, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/sweden/mcfg_sw.mbn", 0xc438, 460, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tim/commerci/italy/mcfg_sw.mbn", 0xa47c, 461, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/turkcell/commerci/tr/mcfg_sw.mbn", 0xb584, 462, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/turktele/commerci/tr/mcfg_sw.mbn", 0xc6c0, 463, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vivacom/commerci/bg/mcfg_sw.mbn", 0xc98c, 464, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/commerci/hungary/mcfg_sw.mbn", 0x9ee4, 465, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/commerci/ireland/mcfg_sw.mbn", 0xb59c, 466, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/lab/ctc/mcfg_sw.mbn", 0xcc30, 467, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/non_volt/mcfg_sw.mbn", 0x5fe0, 468, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/cz/mcfg_sw.mbn", 0xb9ac, 469, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/germany/mcfg_sw.mbn", 0xc638, 470, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/greece/mcfg_sw.mbn", 0xbfb0, 471, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/italy/mcfg_sw.mbn", 0xa848, 472, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/netherla/mcfg_sw.mbn", 0xbd2c, 473, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/portugal/mcfg_sw.mbn", 0xa5b8, 474, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/romania/mcfg_sw.mbn", 0xc650, 475, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/safrica/mcfg_sw.mbn", 0xb9ac, 476, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/spain/mcfg_sw.mbn", 0xa6b0, 477, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/turkey/mcfg_sw.mbn", 0xbc7c, 478, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/uk/mcfg_sw.mbn", 0xc41c, 479, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/wind/commerci/greece/mcfg_sw.mbn", 0xd2c8, 480, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/kt/commerci/mcfg_sw.mbn", 0x9808, 481, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/lgu/commerci/mcfg_sw.mbn", 0x9f48, 482, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/skt/commerci/mcfg_sw.mbn", 0xa1ec, 483, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/tta/commerci/mcfg_sw.mbn", 0x98d8, 484, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/amx/commerci/mx/mcfg_sw.mbn", 0xb960, 485, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/amx/non_volt/mcfg_sw.mbn", 0x39a0, 486, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/att/commerci/mexico/mcfg_sw.mbn", 0xbf34, 487, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/chile/mcfg_sw.mbn", 0xc828, 488, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/colombia/mcfg_sw.mbn", 0xcd34, 489, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/peru/mcfg_sw.mbn", 0xc8c4, 490, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/telefoni/commerci/colombia/mcfg_sw.mbn", 0x9b88, 491, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/telefoni/commerci/mx/mcfg_sw.mbn", 0xc03c, 492, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/telefoni/commerci/peru/mcfg_sw.mbn", 0xb9f8, 493, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/wom/commerci/cl/mcfg_sw.mbn", 0xb3d4, 494, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/etisalat/commerci/ae/mcfg_sw.mbn", 0xa3b4, 495, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/mobily/commerci/sa/mcfg_sw.mbn", 0xbbd8, 496, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/ooredoo/commerci/qa/mcfg_sw.mbn", 0xb870, 497, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/stc/commerci/sa/mcfg_sw.mbn", 0xb5d4, 498, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/zain/commerci/sa/mcfg_sw.mbn", 0xb520, 499, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/firstnet/mcfg_sw.mbn", 0xcc14, 500, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/non_volt/mcfg_sw.mbn", 0x613c, 501, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/volte/mcfg_sw.mbn", 0xcd58, 502, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/bell/commerci/ca/mcfg_sw.mbn", 0xcdb4, 503, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/rogers/commerci/ca/mcfg_sw.mbn", 0xb888, 504, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/sprint/commerci/mcfg_sw.mbn", 0xef38, 505, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/sprint/vowifi/mcfg_sw.mbn", 0xeea4, 506, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/telus/commerci/ca/mcfg_sw.mbn", 0xbc98, 507, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/tmo/commerci/mcfg_sw.mbn", 0xd0e4, 508, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/uscc/commerci/mcfg_sw.mbn", 0xa560, 509, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/cdmaless/mcfg_sw.mbn", 0x10ec8, 510, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/hvolte/mcfg_sw.mbn", 0x128dc, 511, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/imsless/mcfg_sw.mbn", 0x8e5c, 512, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/beeline/gen_3gpp/mcfg_sw.mbn", 0xc2cc, 513, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/megafon/commerci/ru/mcfg_sw.mbn", 0xd954, 514, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/mts/commerci/ru/mcfg_sw.mbn", 0x513c, 515, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/tele2/commerci/ru/mcfg_sw.mbn", 0xbfa0, 516, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sa/brazil/commerci/mcfg_sw.mbn", 0x33dc, 517, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/3hk/commerci/hk/mcfg_sw.mbn", 0xbd30, 518, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/ais/commerci/thailand/mcfg_sw.mbn", 0xbeb4, 519, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/apt/commerci/mcfg_sw.mbn", 0xba68, 520, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/chunghwa/commerci/tw/mcfg_sw.mbn", 0xdefc, 521, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/digi/commerci/malaysia/mcfg_sw.mbn", 0xb4c8, 522, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/dtac/commerci/volte/mcfg_sw.mbn", 0xb0a0, 523, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/fareasto/commerci/mcfg_sw.mbn", 0xbddc, 524, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/globe/commerci/ph/mcfg_sw.mbn", 0xbf60, 525, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/hkt/commerci/hk/mcfg_sw.mbn", 0xb1ac, 526, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/indosat/commerci/mcfg_sw.mbn", 0xd438, 527, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/m1/commerci/sg/mcfg_sw.mbn", 0xadf0, 528, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/maxis/commerci/maxis/mcfg_sw.mbn", 0xcbd0, 529, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/mytel/commerci/mm/mcfg_sw.mbn", 0xbbec, 530, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/p1/commerci/malaysia/mcfg_sw.mbn", 0xba60, 531, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/seatel/commerci/cambodia/mcfg_sw.mbn", 0xba00, 532, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/singtel/commerci/singapor/mcfg_sw.mbn", 0xba40, 533, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smartfre/commerci/mcfg_sw.mbn", 0xc1a8, 534, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smartfre/commerci/vowifi/mcfg_sw.mbn", 0xc894, 535, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smartone/commerci/hk/mcfg_sw.mbn", 0xc3e4, 536, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/starhub/commerci/sg/mcfg_sw.mbn", 0x9bbc, 537, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/telenor/commerci/mcfg_sw.mbn", 0xc140, 538, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/telkomse/commerci/mcfg_sw.mbn", 0x11878, 539, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/tm/commerci/mcfg_sw.mbn", 0xb730, 540, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/truemove/commerci/volte/mcfg_sw.mbn", 0xbb70, 541, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/tstar/commerci/tw/mcfg_sw.mbn", 0xaa08, 542, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/umobile/commerci/malaysia/mcfg_sw.mbn", 0xc2c8, 543, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/viettel/commerci/vietnam/mcfg_sw.mbn", 0xbd4c, 544, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/xl/commerci/mcfg_sw.mbn", 0xd428, 545, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/ytl/commerci/mcfg_sw.mbn", 0x16f58, 546, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/mbn_sw.dig", 0x20, 547, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/mbn_sw.txt", 0x2413, 548, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/oem_j20s.txt", 0x1d81, 549, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/oem_sw.txt", 0x196f, 550, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/oem_sw_a.txt", 0x1877, 551, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/oem_sw_w.txt", 0x1879, 552, 1 },
++	{ "image/modemr.jsn", 0x2cf, 553, 1 },
++	{ "image/modemuw.jsn", 0x2c9, 554, 1 },
++	{ "image/npu.b00", 0xd4, 555, 1 },
++	{ "image/npu.b01", 0x1a98, 556, 1 },
++	{ "image/npu.b02", 0x9738, 557, 1 },
++	{ "image/npu.b03", 0x1e74, 558, 1 },
++	{ "image/npu.b04", 0x0, 559, 0 },
++	{ "image/npu.mdt", 0x1b6c, 559, 1 },
++	{ "image/otrpapp.b00", 0x134, 560, 1 },
++	{ "image/otrpapp.b01", 0x1b28, 561, 1 },
++	{ "image/otrpapp.b02", 0x4f9a0, 562, 1 },
++	{ "image/otrpapp.b03", 0x8f, 563, 1 },
++	{ "image/otrpapp.b04", 0x3b94, 564, 1 },
++	{ "image/otrpapp.b05", 0x238, 565, 1 },
++	{ "image/otrpapp.b06", 0x98, 566, 1 },
++	{ "image/otrpapp.b07", 0xc861, 567, 1 },
++	{ "image/otrpapp.mdt", 0x1c5c, 568, 1 },
++	{ "image/qdsp6m.qdb", 0x524817, 569, 1 },
++	{ "image/rtic.mbn", 0x4a59f, 570, 1 },
++	{ "image/secauth.b00", 0x134, 571, 1 },
++	{ "image/secauth.b01", 0x1b28, 572, 1 },
++	{ "image/secauth.b02", 0x5bac, 573, 1 },
++	{ "image/secauth.b03", 0x8f, 574, 1 },
++	{ "image/secauth.b04", 0x4e8, 575, 1 },
++	{ "image/secauth.b05", 0xe4, 576, 1 },
++	{ "image/secauth.b06", 0x98, 577, 1 },
++	{ "image/secauth.b07", 0x121a, 578, 1 },
++	{ "image/secauth.mdt", 0x1c5c, 579, 1 },
++	{ "image/securemm.b00", 0x200, 580, 1 },
++	{ "image/securemm.b01", 0x1b28, 581, 1 },
++	{ "image/securemm.b02", 0x11ce9, 582, 1 },
++	{ "image/securemm.b03", 0xaf, 583, 1 },
++	{ "image/securemm.b04", 0x25d8, 584, 1 },
++	{ "image/securemm.b05", 0x210, 585, 1 },
++	{ "image/securemm.b06", 0x130, 586, 1 },
++	{ "image/securemm.b07", 0x277c, 587, 1 },
++	{ "image/securemm.mdt", 0x1d28, 588, 1 },
++	{ "image/slpi_vy.b00", 0x2f4, 589, 1 },
++	{ "image/slpi_vy.b01", 0x1dc8, 590, 1 },
++	{ "image/slpi_vy.b02", 0x271c, 591, 1 },
++	{ "image/slpi_vy.b03", 0x2940c, 592, 1 },
++	{ "image/slpi_vy.b04", 0x1f9290, 593, 1 },
++	{ "image/slpi_vy.b05", 0x130bf4, 594, 1 },
++	{ "image/slpi_vy.b06", 0x2bad4, 595, 1 },
++	{ "image/slpi_vy.b07", 0x16f8c, 596, 1 },
++	{ "image/slpi_vy.b08", 0xe081, 597, 1 },
++	{ "image/slpi_vy.b09", 0x52, 598, 1 },
++	{ "image/slpi_vy.b10", 0x7240, 599, 1 },
++	{ "image/slpi_vy.b11", 0x3c000, 600, 1 },
++	{ "image/slpi_vy.b12", 0x13bec1, 601, 1 },
++	{ "image/slpi_vy.b13", 0x69244, 602, 1 },
++	{ "image/slpi_vy.b14", 0x433d0, 603, 1 },
++	{ "image/slpi_vy.b15", 0x8004, 604, 1 },
++	{ "image/slpi_vy.b16", 0xf5a8, 605, 1 },
++	{ "image/slpi_vy.b17", 0xcf9c, 606, 1 },
++	{ "image/slpi_vy.b18", 0x6c72c, 607, 1 },
++	{ "image/slpi_vy.b19", 0x508c4, 608, 1 },
++	{ "image/slpi_vy.b20", 0xec, 609, 1 },
++	{ "image/slpi_vy.mdt", 0x20bc, 610, 1 },
++	{ "image/slpir.jsn", 0x193, 611, 1 },
++	{ "image/slpius.jsn", 0x195, 612, 1 },
++	{ "image/smplap32.b00", 0x134, 613, 1 },
++	{ "image/smplap32.b01", 0x1b28, 614, 1 },
++	{ "image/smplap32.b02", 0x3f534, 615, 1 },
++	{ "image/smplap32.b03", 0xc2, 616, 1 },
++	{ "image/smplap32.b04", 0x153a04, 617, 1 },
++	{ "image/smplap32.b05", 0x51c, 618, 1 },
++	{ "image/smplap32.b06", 0x98, 619, 1 },
++	{ "image/smplap32.b07", 0x8bcb, 620, 1 },
++	{ "image/smplap32.mdt", 0x1c5c, 621, 1 },
++	{ "image/smplap64.b00", 0x200, 622, 1 },
++	{ "image/smplap64.b01", 0x1b28, 623, 1 },
++	{ "image/smplap64.b02", 0x4b7aa, 624, 1 },
++	{ "image/smplap64.b03", 0xec, 625, 1 },
++	{ "image/smplap64.b04", 0x154af8, 626, 1 },
++	{ "image/smplap64.b05", 0xa38, 627, 1 },
++	{ "image/smplap64.b06", 0x130, 628, 1 },
++	{ "image/smplap64.b07", 0xdb19, 629, 1 },
++	{ "image/smplap64.mdt", 0x1d28, 630, 1 },
++	{ "image/soter64.b00", 0x200, 631, 1 },
++	{ "image/soter64.b01", 0x1b28, 632, 1 },
++	{ "image/soter64.b02", 0xcd36, 633, 1 },
++	{ "image/soter64.b03", 0xb5, 634, 1 },
++	{ "image/soter64.b04", 0x918, 635, 1 },
++	{ "image/soter64.b05", 0x288, 636, 1 },
++	{ "image/soter64.b06", 0x130, 637, 1 },
++	{ "image/soter64.b07", 0x1b73, 638, 1 },
++	{ "image/soter64.mdt", 0x1d28, 639, 1 },
++	{ "image/tamapp.b00", 0x134, 640, 1 },
++	{ "image/tamapp.b01", 0x1b28, 641, 1 },
++	{ "image/tamapp.b02", 0x4264, 642, 1 },
++	{ "image/tamapp.b03", 0x81, 643, 1 },
++	{ "image/tamapp.b04", 0x2ec, 644, 1 },
++	{ "image/tamapp.b05", 0xd4, 645, 1 },
++	{ "image/tamapp.b06", 0x98, 646, 1 },
++	{ "image/tamapp.b07", 0xedc, 647, 1 },
++	{ "image/tamapp.mdt", 0x1c5c, 648, 1 },
++	{ "image/venus.b00", 0xd4, 649, 1 },
++	{ "image/venus.b01", 0x1a98, 650, 1 },
++	{ "image/venus.b02", 0x103118, 651, 1 },
++	{ "image/venus.b03", 0x9e44, 652, 1 },
++	{ "image/venus.b04", 0x20, 653, 1 },
++	{ "image/venus.mdt", 0x1b6c, 654, 1 },
++	{ "image/voicepri.b00", 0x134, 655, 1 },
++	{ "image/voicepri.b01", 0x1b28, 656, 1 },
++	{ "image/voicepri.b02", 0x1c218, 657, 1 },
++	{ "image/voicepri.b03", 0x85, 658, 1 },
++	{ "image/voicepri.b04", 0x57d4, 659, 1 },
++	{ "image/voicepri.b05", 0x19c, 660, 1 },
++	{ "image/voicepri.b06", 0x98, 661, 1 },
++	{ "image/voicepri.b07", 0x8216, 662, 1 },
++	{ "image/voicepri.mdt", 0x1c5c, 663, 1 },
++	{ "image/vsimapp.b00", 0x134, 664, 1 },
++	{ "image/vsimapp.b01", 0x1b28, 665, 1 },
++	{ "image/vsimapp.b02", 0x7ce4, 666, 1 },
++	{ "image/vsimapp.b03", 0xb2, 667, 1 },
++	{ "image/vsimapp.b04", 0x3bc, 668, 1 },
++	{ "image/vsimapp.b05", 0x10c, 669, 1 },
++	{ "image/vsimapp.b06", 0x98, 670, 1 },
++	{ "image/vsimapp.b07", 0x1533, 671, 1 },
++	{ "image/vsimapp.mdt", 0x1c5c, 672, 1 },
++	{ "image/widevine.mbn", 0x2d2e8, 673, 1 },
++	{ "image/wlanmdsp.mbn", 0x3ddddc, 674, 1 },
++};
+-- 
+2.53.0
+

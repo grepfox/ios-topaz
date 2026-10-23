@@ -1,0 +1,140 @@
+From f0897c00f23ce1f9a62b768abf7819d930ad44f5 Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 18:50:53 +0200
+Subject: [PATCH] vayu-0188: A640 hardware clock gating (KGSL a640_hwcg_regs,
+ GMU AO CGC, SP clock toggle, RBBM_CLOCK_CNTL); GPU pool 0x1d0000000 + 768 MB
+ with maxmem=4352
+
+---
+ bsd/dev/vayu_gpu.c               | 74 +++++++++++++++++++++++++++++++-
+ iokit/Kernel/arm/TopazAdreno.cpp | 17 +++++++-
+ 2 files changed, 88 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/vayu_gpu.c b/bsd/dev/vayu_gpu.c
+index 63ff7d7..0af30dd 100644
+--- a/bsd/dev/vayu_gpu.c
++++ b/bsd/dev/vayu_gpu.c
+@@ -1164,7 +1164,6 @@ vg_kick_wait(const char *what)
+ 	return false;
+ }
+ 
+-/* KGSL a6xx_start with the A640 values (no HWCG, no CP protect for the bring-up) */
+ static void
+ vg_mark(const char *what)
+ {
+@@ -1172,11 +1171,84 @@ vg_mark(const char *what)
+ 	sweet_log_flush_now();
+ }
+ 
++/*
++ * Hardware clock gating, KGSL a640_hwcg_regs and a6xx_hwcg_set(on) (generated from the YAAP
++ * kernel's adreno_a6xx.c). 1007 boot: without it Mesa's first real draws hung the GPU
++ * (RBBM_STATUS 0xe59005: CP, PC, VFD, VPC, TPL1, HLSQ busy, no fault).
++ */
++static const uint32_t vg_a640_hwcg[][2] = {
++	{ 0x000b0, 0x02222222 },   /* RBBM_CLOCK_CNTL_SP0 */
++	{ 0x000b4, 0x02222220 },   /* RBBM_CLOCK_CNTL2_SP0 */
++	{ 0x000b8, 0x00000080 },   /* RBBM_CLOCK_DELAY_SP0 */
++	{ 0x000bc, 0x0000f3cf },   /* RBBM_CLOCK_HYST_SP0 */
++	{ 0x000c0, 0x02222222 },   /* RBBM_CLOCK_CNTL_TP0 */
++	{ 0x000c4, 0x22222222 },   /* RBBM_CLOCK_CNTL2_TP0 */
++	{ 0x000c8, 0x22222222 },   /* RBBM_CLOCK_CNTL3_TP0 */
++	{ 0x000cc, 0x00022222 },   /* RBBM_CLOCK_CNTL4_TP0 */
++	{ 0x000d0, 0x11111111 },   /* RBBM_CLOCK_DELAY_TP0 */
++	{ 0x000d4, 0x11111111 },   /* RBBM_CLOCK_DELAY2_TP0 */
++	{ 0x000d8, 0x11111111 },   /* RBBM_CLOCK_DELAY3_TP0 */
++	{ 0x000dc, 0x00011111 },   /* RBBM_CLOCK_DELAY4_TP0 */
++	{ 0x000e0, 0x77777777 },   /* RBBM_CLOCK_HYST_TP0 */
++	{ 0x000e4, 0x77777777 },   /* RBBM_CLOCK_HYST2_TP0 */
++	{ 0x000e8, 0x77777777 },   /* RBBM_CLOCK_HYST3_TP0 */
++	{ 0x000ec, 0x00077777 },   /* RBBM_CLOCK_HYST4_TP0 */
++	{ 0x000f0, 0x22222222 },   /* RBBM_CLOCK_CNTL_RB0 */
++	{ 0x000f4, 0x01002222 },   /* RBBM_CLOCK_CNTL2_RB0 */
++	{ 0x000f8, 0x00002220 },   /* RBBM_CLOCK_CNTL_CCU0 */
++	{ 0x00100, 0x00040f00 },   /* RBBM_CLOCK_HYST_RB_CCU0 */
++	{ 0x00104, 0x05222022 },   /* RBBM_CLOCK_CNTL_RAC */
++	{ 0x00105, 0x00005555 },   /* RBBM_CLOCK_CNTL2_RAC */
++	{ 0x00106, 0x00000011 },   /* RBBM_CLOCK_DELAY_RAC */
++	{ 0x00107, 0x00445044 },   /* RBBM_CLOCK_HYST_RAC */
++	{ 0x00108, 0x04222222 },   /* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{ 0x00111, 0x00002222 },   /* RBBM_CLOCK_MODE_VFD */
++	{ 0x00114, 0x00222222 },   /* RBBM_CLOCK_MODE_GPC */
++	{ 0x00117, 0x00000002 },   /* RBBM_CLOCK_DELAY_HLSQ_2 */
++	{ 0x0011b, 0x00002222 },   /* RBBM_CLOCK_MODE_HLSQ */
++	{ 0x00109, 0x00004000 },   /* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{ 0x00112, 0x00002222 },   /* RBBM_CLOCK_DELAY_VFD */
++	{ 0x00115, 0x00000200 },   /* RBBM_CLOCK_DELAY_GPC */
++	{ 0x0011c, 0x00000000 },   /* RBBM_CLOCK_DELAY_HLSQ */
++	{ 0x0010a, 0x00000000 },   /* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{ 0x00113, 0x00000000 },   /* RBBM_CLOCK_HYST_VFD */
++	{ 0x00116, 0x04104004 },   /* RBBM_CLOCK_HYST_GPC */
++	{ 0x0011d, 0x00000000 },   /* RBBM_CLOCK_HYST_HLSQ */
++	{ 0x00120, 0x00000222 },   /* RBBM_CLOCK_CNTL_TEX_FCHE */
++	{ 0x00121, 0x00000111 },   /* RBBM_CLOCK_DELAY_TEX_FCHE */
++	{ 0x00122, 0x00000777 },   /* RBBM_CLOCK_HYST_TEX_FCHE */
++	{ 0x0010b, 0x22222222 },   /* RBBM_CLOCK_CNTL_UCHE */
++	{ 0x00110, 0x00000004 },   /* RBBM_CLOCK_HYST_UCHE */
++	{ 0x0010f, 0x00000002 },   /* RBBM_CLOCK_DELAY_UCHE */
++	{ 0x00533, 0x00000182 },   /* RBBM_ISDB_CNT */
++	{ 0x00044, 0x00000000 },   /* RBBM_RAC_THRESHOLD_CNT */
++	{ 0x00042, 0x00000000 },   /* RBBM_SP_HYST_CNT */
++	{ 0x00118, 0x00000222 },   /* RBBM_CLOCK_CNTL_GMU_GX */
++	{ 0x00119, 0x00000111 },   /* RBBM_CLOCK_DELAY_GMU_GX */
++	{ 0x0011a, 0x00000555 },   /* RBBM_CLOCK_HYST_GMU_GX */
++};
++
++static void
++vg_hwcg(void)
++{
++	gmu_wr(0x23b09, 0x00020202);            /* GMU_AO_GMU_CGC_MODE_CNTL (a640) */
++	gmu_wr(0x23b0a, 0x00010111);            /* ..._DELAY_CNTL */
++	gmu_wr(0x23b0b, 0x00005555);            /* ..._HYST_CNTL */
++	gmu_wr(0x1a880, gmu_rd(0x1a880) & ~1u); /* GX_SPTPRAC_CLOCK_CONTROL: SP clock off while programming */
++	for (unsigned i = 0; i < sizeof(vg_a640_hwcg) / sizeof(vg_a640_hwcg[0]); i++) {
++		wr(vg_gpu, 4u * vg_a640_hwcg[i][0], vg_a640_hwcg[i][1]);
++	}
++	gmu_wr(0x1a880, gmu_rd(0x1a880) | 1u);  /* SP clock back on */
++	wr(vg_gpu, 4u * 0xae, 0x8AA8AA82u);     /* RBBM_CLOCK_CNTL on (a640) */
++}
++
++/* KGSL a6xx_start with the A640 values (HWCG on, no CP protect for the bring-up) */
+ static void
+ vg_hw_init(void)
+ {
+ 	static const uint32_t addr_mode[] = { 0x842, 0xC01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
+ 		                              0xE00, 0xae01, 0xb601, 0xF810 };
++	vg_hwcg();
+ 	gpu_w(0x3c45, 0);                       /* GBIF halt off */
+ 	(void)gpu_r(0x3c45);
+ 	gpu_w(0x16, 0);
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 62bed83..1cfadf4 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -275,8 +275,21 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	}
+ 	if (!gpu_pool_ready) {
+ 		if (sweet_soc_vayu()) {
+-			gpu_pool_base = 0xb0000000ull;
+-			gpu_pool_size = 0x0c000000ull;
++			/*
++			 * 192 MB below the kernel by default. 1007 boot: Mesa ran it dry
++			 * ("the GPU pool has no 12582912 bytes left"). With maxmem=4352 the
++			 * kernel ends at 0x1d0000000 (its RAM starts at 0xc0000000) and the
++			 * top 768 MB of DRAM are the pool (the GPU stream maps all DRAM).
++			 */
++			uint32_t mm = 0;
++			if (PE_parse_boot_argn("maxmem", &mm, sizeof(mm)) && mm != 0 && mm <= 4352) {
++				gpu_pool_base = 0x1d0000000ull;
++				gpu_pool_size = 0x30000000ull;
++			} else {
++				gpu_pool_base = 0xb0000000ull;
++				gpu_pool_size = 0x0c000000ull;
++			}
++			IOLog("TopazGPU: vayu GPU pool %#llx + %llu MB\n", gpu_pool_base, gpu_pool_size >> 20);
+ 		}
+ 		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+ 		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
+-- 
+2.53.0
+

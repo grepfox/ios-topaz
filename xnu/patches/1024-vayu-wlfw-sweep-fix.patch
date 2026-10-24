@@ -1,0 +1,81 @@
+From 90b385cd8730e65ab58f58b49d6e99237fa8d4fb Mon Sep 17 00:00:00 2001
+From: grep <ghanishftw@gmail.com>
+Date: Sat, 24 Oct 2026 16:31:34 +0200
+Subject: [PATCH] vayu: wlfw sweep: fall back to the ath10k ind_register when
+ the icnss TLVs are rejected; escalation never waits on MSA_READY
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 64cf1ec..567d6e0 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3448,7 +3448,7 @@ static unsigned w_var;
+ static uint8_t w_ind_style;                 /* 0 ath10k, 1 icnss, 2 every indication */
+ static uint8_t w_cal_kind = 1;              /* 1 meta_data_len 0, 2 empty request */
+ static uint32_t w_cal_delay, w_cal_at_ms, w_wait_until, w_wait_ms;
+-static bool w_escalate, w_escalated;
++static bool w_escalate, w_escalated, w_icnss_msgs;
+ 
+ struct wvar {
+ 	uint8_t host_cap, ind;
+@@ -3478,6 +3478,7 @@ w_var_apply(unsigned r)
+ 	w_escalated = false;
+ 	if (!w_sweep) {
+ 		w_ind_style = 0;
++		w_icnss_msgs = false;
+ 		w_cal_kind = 1;
+ 		w_cal_delay = w_wait_ms = 0;
+ 		w_escalate = false;
+@@ -3488,6 +3489,7 @@ w_var_apply(unsigned r)
+ 	w_mode = (v->host_cap ? 0 : 2) | (v->bdf ? 0 : 1) | (v->cal ? 0 : 4);
+ 	strlcpy(w_bdf_arg, v->bdf ? v->bdf : "", sizeof(w_bdf_arg));
+ 	w_ind_style = v->ind;
++	w_icnss_msgs = v->ind >= 1;
+ 	w_cal_kind = v->cal ? v->cal : 1;
+ 	w_cal_delay = v->cal_delay;
+ 	w_wait_ms = v->wait;
+@@ -3884,6 +3886,19 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			memcpy(&st, v, 8);
+ 		}
+ 		LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx", g_ms, ok ? "ok" : "FAILED", err, st);
++		if (!ok && w_ind_style != 0) {
++			/* 1023a: the icnss TLVs (pin_connect/rejuvenate) are rejected with err 1 and then
++			 * MSA_READY is never indicated: register again the ath10k way */
++			LOG("wlfw sweep: extra indications rejected, registering again with fw_ready/msa_ready only");
++			w_ind_style = 0;
++			if (wm_new(&m, WLFW_IND_REGISTER)) {
++				wm_u8(&m, 0x10, 1);
++				wm_u8(&m, 0x13, 1);
++				wm_u32(&m, 0x15, WLFW_CLIENT_ID);
++				wm_send(&m);
++			}
++			break;
++		}
+ 		if (w_mode & 2) {
+ 			if (wm_new(&m, WLFW_MSA_INFO)) {    /* host_cap skipped (wlfwmode bit 2) */
+ 				uint64_t a = WLFW_MSA_BASE;
+@@ -3924,7 +3939,7 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		LOG("t=%u ms: wlfw: cap %s err %u (try %u)", g_ms, ok ? "ok" : "FAILED", err, w_cap_tries + 1);
+ 		if (ok) {
+ 			w_on_cap(d, len);
+-			if (w_ind_style >= 1) {             /* MIUI icnss after cap: feature mask, vbatt */
++			if (w_icnss_msgs) {                 /* MIUI icnss after cap: feature mask, vbatt */
+ 				if (wm_new(&m, WLFW_DYN_FEATURE)) {
+ 					uint64_t mask = 1;          /* QMI_WLFW_FW_REJUVENATE_V01 */
+ 					wm_tlv(&m, 0x10, &mask, 8);
+@@ -6497,7 +6512,8 @@ radio_poll(unsigned ms)
+ 			w_cal_kind = 1;
+ 			w_cal_delay = 0;
+ 			if (!w_bdf_started) {
+-				LOG("wlfw sweep: now BDF bd_j20s + cal_report, to restart the PD for the next variant");
++				LOG("wlfw sweep: now BDF bd_j20s + cal_report, to restart the PD for the next variant (msa_ind %u cap %u)", w_msa_ind, w_cap_done);
++				w_msa_ind = w_cap_done = true;  /* never wait on an indication that may not come */
+ 				w_mode &= 2;
+ 				strlcpy(w_bdf_arg, "bd_j20s.bin", sizeof(w_bdf_arg));
+ 				w_start_bdf();
+-- 
+2.53.0
+

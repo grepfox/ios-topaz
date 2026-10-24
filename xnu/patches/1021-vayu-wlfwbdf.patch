@@ -1,0 +1,77 @@
+From 39ce76823a80990377f085b79b154782d99f5223 Mon Sep 17 00:00:00 2001
+From: grep <ghanishftw@gmail.com>
+Date: Sat, 24 Oct 2026 11:33:37 +0200
+Subject: [PATCH] vayu: WLAN board data from Xiaomi's bd_j20s.bin (wlfwbdf=),
+ BDF+cal back on by default
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 7108b64..6a35a45 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3426,6 +3426,7 @@ static uint32_t w_node, w_port, w_board = 0xFF, w_bdf_seg;
+  * "EX:wlan_process:0x1:WLAN RT:0x68:PC=0xb0193780". Default 1 on vayu, 0 elsewhere.
+  */
+ static uint32_t w_mode;
++static char w_bdf_arg[40];               /* wlfwbdf=: board file in image/, tried first */
+ static uint16_t w_txn = 1;
+ static bool w_msa_ind, w_cap_done, w_bdf_started, w_fw_ready, w_mission;
+ static int w_bdf_fi = -1;
+@@ -3550,6 +3551,25 @@ w_start_bdf(void)
+ 		return;
+ 	}
+ 	w_bdf_started = true;
++	{
++		unsigned nbd = 0;
++		for (unsigned i = 0; i < fw_all_n; i++) {
++			const char *n = fw_all[i].path;
++			if (strncmp(n, "image/bd", 8) == 0 && strncmp(n, "image/bdwlan.", 13) != 0) {
++				LOG("wlfw: board file on the partition: %s (%u bytes)", n, (unsigned)fw_all[i].size);
++				nbd++;
++			}
++		}
++		LOG("wlfw: %u non-bdwlan board files", nbd);
++	}
++	if (w_bdf_arg[0]) {
++		snprintf(name, sizeof(name), "image/%s", w_bdf_arg);
++		w_bdf_fi = fw_all_find(name);
++		if (w_bdf_fi >= 0) {
++			goto found;
++		}
++		LOG("wlfw: wlfwbdf %s missing", name);
++	}
+ 	if (w_board == 0xFF) {
+ 		snprintf(name, sizeof(name), "image/bdwlan.bin");
+ 	} else if (w_board < 0x100) {
+@@ -3567,6 +3587,7 @@ w_start_bdf(void)
+ 		LOG("wlfw: no board data file");
+ 		return;
+ 	}
++found:
+ 	w_bdf_len = fw_all[w_bdf_fi].size;
+ 	w_bdf_off = 0;
+ 	w_bdf_seg = 0;
+@@ -3899,9 +3920,15 @@ wifi_enabled(void)
+ 	if (wifi_on < 0) {
+ 		uint32_t v = 0;
+ 		wifi_on = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
+-		w_mode = g_rmtfs_nav ? 0 : 1;            /* vayu (no NAV) defaults to 1 */
++		w_mode = 0;
+ 		(void)PE_parse_boot_argn("wlfwmode", &w_mode, sizeof(w_mode));
+-		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report)", w_mode);
++		/* vayu: Xiaomi's J20S board file (bdwlan.bin is a generic one) */
++		strlcpy(w_bdf_arg, g_rmtfs_nav ? "" : "bd_j20s.bin", sizeof(w_bdf_arg));
++		(void)PE_parse_boot_arg_str("wlfwbdf", w_bdf_arg, sizeof(w_bdf_arg));
++		if (strcmp(w_bdf_arg, "-") == 0) {
++			w_bdf_arg[0] = 0;
++		}
++		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report), wlfwbdf \"%s\"", w_mode, w_bdf_arg);
+ 	}
+ 	return wifi_on > 0;
+ }
+-- 
+2.53.0
+

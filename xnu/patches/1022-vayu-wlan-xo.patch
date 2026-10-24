@@ -1,0 +1,125 @@
+From 59abb16b85f53e53e03a7d1592ea8fbf406ab85f Mon Sep 17 00:00:00 2001
+From: grep <ghanishftw@gmail.com>
+Date: Sat, 24 Oct 2026 14:21:08 +0200
+Subject: [PATCH] vayu: WCN3998 XO vote rfclka2 (wlclk=), wlfwmode 8 skips MSA
+ assign
+
+---
+ bsd/dev/sweet_rpmh.c            | 43 +++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 18 +++++++++++++-
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index d20b744..560c218 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -406,6 +406,7 @@ out:
+ int sweet_cmddb_aux(const char *res, void *buf, unsigned max);
+ int sweet_rpmh_arc_vote(const char *res, unsigned vlvl);
+ int sweet_rpmh_ldo(const char *res, unsigned mv);
++int sweet_rpmh_vrm_clk(const char *res);
+ 
+ #define RH_ARC          3u
+ 
+@@ -488,6 +489,48 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * A VRM clock buffer on (clk-rpmh DEFINE_CLK_RPMH_VRM: enable word at +4 = 1), e.g. the
++ * WCN3998's XO "rfclka2" (mainline sm8150 wifi cxo_ref_clk_pin = RPMH_RF_CLK2).
++ */
++int sweet_rpmh_vrm_clk(const char *res);
++int
++sweet_rpmh_vrm_clk(const char *res)
++{
++	static const char *ok[] = { "rfclka1", "rfclka2", "rfclka3", "lnbclka1", "lnbclka2", "lnbclka3" };
++	unsigned i;
++	for (i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
++		if (res && strcmp(res, ok[i]) == 0) {
++			break;
++		}
++	}
++	if (i == sizeof(ok) / sizeof(ok[0])) {
++		printf("SWEET RPMH: %s not in the clock list\n", res ? res : "(null)");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, &address);
++	}
++	if (!error) {
++		const uint32_t offsets[1] = {4};
++		const uint32_t values[1] = {1};
++		error = rh_send(address, 1, offsets, values);
++	}
++	printf("SWEET RPMH: clock %s on: %d\n", res, error);
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /*
+  * cmd-db aux data of one resource (e.g. ARC "gfx.lvl": u16 voltage levels,
+  * zero padded), read only. Returns the length copied, or -errno.
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 6a35a45..71b366b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3682,6 +3682,10 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
+ 		if (again) {
+ 			continue;
+ 		}
++		if (w_mode & 8) {
++			LOG(" not assigned (wlfwmode %u: fixed MSA permissions)", w_mode);
++			continue;
++		}
+ 		if (scm_assign(addr, size, vm, sec ? 2 : 3) == 0) {
+ 			for (unsigned k = 0; k < 4; k++) {
+ 				if (done[k] == 0) {
+@@ -3928,7 +3932,7 @@ wifi_enabled(void)
+ 		if (strcmp(w_bdf_arg, "-") == 0) {
+ 			w_bdf_arg[0] = 0;
+ 		}
+-		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report), wlfwbdf \"%s\"", w_mode, w_bdf_arg);
++		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report, 8 no MSA assign), wlfwbdf \"%s\"", w_mode, w_bdf_arg);
+ 	}
+ 	return wifi_on > 0;
+ }
+@@ -6881,6 +6885,7 @@ soc_select_vayu(void)
+ extern "C" int sweet_aop_send(const char *msg);                     /* bsd/dev/sweet_qmp.c */
+ extern "C" int sweet_rpmh_arc_vote(const char *res, unsigned vlvl);  /* bsd/dev/sweet_rpmh.c */
+ extern "C" int sweet_rpmh_ldo(const char *res, unsigned mv);
++extern "C" int sweet_rpmh_vrm_clk(const char *res);
+ 
+ static void
+ vayu_power_up(void)
+@@ -6892,6 +6897,17 @@ vayu_power_up(void)
+ 		int a = sweet_rpmh_ldo("ldoa1", 752), b = sweet_rpmh_ldo("ldoa7", 1800);
+ 		int c = sweet_rpmh_ldo("ldoc2", 1304), d = sweet_rpmh_ldo("ldoc11", 3104);
+ 		LOG("vayu: WCN3998 rails L1A %d L7A %d L2C %d L11C %d", a, b, c, d);
++		/* wlclk=N: rfclkaN on (default 2, the mainline sm8150 wifi XO), 0x1N: lnbclkaN, 0: none */
++		uint32_t clk = 2;
++		(void)PE_parse_boot_argn("wlclk", &clk, sizeof(clk));
++		if ((clk & 0xF) >= 1 && (clk & 0xF) <= 3) {
++			char n[12];
++			snprintf(n, sizeof(n), "%s%u", (clk & 0x10) ? "lnbclka" : "rfclka", clk & 0xF);
++			int e = sweet_rpmh_vrm_clk(n);
++			LOG("vayu: WCN3998 XO %s on: %d", n, e);
++		} else {
++			LOG("vayu: WCN3998 XO: no clock vote (wlclk %u)", clk);
++		}
+ 	}
+ }
+ 
+-- 
+2.53.0
+

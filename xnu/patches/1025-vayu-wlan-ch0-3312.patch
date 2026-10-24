@@ -1,0 +1,33 @@
+From eceb94a34283ef1e9537195e85f0c99934bb39da Mon Sep 17 00:00:00 2001
+From: grep <ghanishftw@gmail.com>
+Date: Sat, 24 Oct 2026 18:01:54 +0200
+Subject: [PATCH] vayu: WCN3998 L11C (vdd-3.3-ch0) at 3312 mV like MIUI btpower
+ (wlch0mv=)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 567d6e0..1d42272 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7054,7 +7054,14 @@ vayu_power_up(void)
+ 	LOG("vayu: AOP load_state modem on: %d; vdd_cx TURBO %d, vdd_mss TURBO %d", aop, cx, mss);
+ 	if (wifi_enabled()) {
+ 		int a = sweet_rpmh_ldo("ldoa1", 752), b = sweet_rpmh_ldo("ldoa7", 1800);
+-		int c = sweet_rpmh_ldo("ldoc2", 1304), d = sweet_rpmh_ldo("ldoc11", 3104);
++		/* wlch0mv=: L11C (vdd-3.3-ch0, the PA). MIUI icnss allows 3104..3312 but MIUI's
++		 * btpower asks 3312 for the same rail, so on Android it sits at 3.312 V. */
++		uint32_t ch0mv = 3312;
++		(void)PE_parse_boot_argn("wlch0mv", &ch0mv, sizeof(ch0mv));
++		if (ch0mv < 3104 || ch0mv > 3312) {
++			ch0mv = 3312;
++		}
++		int c = sweet_rpmh_ldo("ldoc2", 1304), d = sweet_rpmh_ldo("ldoc11", ch0mv);
+ 		LOG("vayu: WCN3998 rails L1A %d L7A %d L2C %d L11C %d", a, b, c, d);
+ 		/* wlclk=N: rfclkaN on (default 2, the mainline sm8150 wifi XO), 0x1N: lnbclkaN, 0: none */
+ 		uint32_t clk = 2;
+-- 
+2.53.0
+

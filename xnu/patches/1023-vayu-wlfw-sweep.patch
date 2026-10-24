@@ -1,0 +1,258 @@
+From 34957bf374c63c0108e5339bc957585f386f5270 Mon Sep 17 00:00:00 2001
+From: grep <ghanishftw@gmail.com>
+Date: Sat, 24 Oct 2026 15:32:50 +0200
+Subject: [PATCH] vayu: wlfwsweep=1 tries one WLFW setup variant per WLAN PD
+ restart (icnss-style feature mask/vbatt, indications, BDF and cal_report
+ variants)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 159 ++++++++++++++++++++++++++++++--
+ 1 file changed, 151 insertions(+), 8 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 71b366b..64cf1ec 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3433,6 +3433,68 @@ static int w_bdf_fi = -1;
+ static uint32_t w_bdf_len, w_bdf_off;
+ static const char *w_step = "not started";
+ 
++/*
++ * wlfwsweep=1 (vayu 1023): one setup variant per WLAN PD restart, so a single boot tries
++ * them all. 1022f: no cal_report = no crash but no FW_READY; with cal_report the PD dies at
++ * PC 0xb0193780. MIUI's icnss sends no host_cap, BDF or cal_report, but does send a dynamic
++ * feature mask and vbatt after cap, and enables pin_connect/rejuvenate indications. Variants
++ * that do not crash wait wait ms for FW_READY, then (escalate) send BDF + cal_report, which
++ * crashes the PD and so moves the sweep on.
++ */
++#define WLFW_VBATT          0x32
++#define WLFW_DYN_FEATURE    0x3B
++static uint32_t w_sweep;
++static unsigned w_var;
++static uint8_t w_ind_style;                 /* 0 ath10k, 1 icnss, 2 every indication */
++static uint8_t w_cal_kind = 1;              /* 1 meta_data_len 0, 2 empty request */
++static uint32_t w_cal_delay, w_cal_at_ms, w_wait_until, w_wait_ms;
++static bool w_escalate, w_escalated;
++
++struct wvar {
++	uint8_t host_cap, ind;
++	const char *bdf;                        /* NULL: no host BDF */
++	uint8_t cal;                            /* 0 none, 1 normal, 2 empty */
++	uint16_t cal_delay, wait;
++	bool escalate;
++	const char *what;
++};
++static const struct wvar w_vars[] = {
++	{ 0, 1, NULL, 0, 0, 15000, true, "icnss: no host_cap/BDF/cal_report, feature mask + vbatt" },
++	{ 0, 1, "bd_j20s.bin", 0, 0, 15000, true, "icnss + BDF bd_j20s, no cal_report" },
++	{ 0, 2, NULL, 0, 0, 15000, true, "every indication on, no BDF, no cal_report" },
++	{ 1, 0, "bdwlan.bin", 1, 0, 0, false, "ath10k, BDF bdwlan.bin (generic)" },
++	{ 1, 0, "bd_f11gl.bin", 1, 0, 0, false, "ath10k, BDF bd_f11gl" },
++	{ 1, 0, "bdf_f10.bin", 1, 0, 0, false, "ath10k, BDF bdf_f10" },
++	{ 1, 0, "bd_j20s.bin", 2, 0, 0, false, "ath10k, BDF bd_j20s, empty cal_report" },
++	{ 1, 0, "bd_j20s.bin", 1, 3000, 0, false, "ath10k, BDF bd_j20s, cal_report 3 s after BDF" },
++	{ 0, 2, "bd_j20s.bin", 0, 0, 0, false, "last: every indication, BDF bd_j20s, no cal_report, wait" },
++};
++#define W_NVARS (sizeof(w_vars) / sizeof(w_vars[0]))
++
++static void
++w_var_apply(unsigned r)
++{
++	w_cal_at_ms = w_wait_until = 0;
++	w_escalated = false;
++	if (!w_sweep) {
++		w_ind_style = 0;
++		w_cal_kind = 1;
++		w_cal_delay = w_wait_ms = 0;
++		w_escalate = false;
++		return;
++	}
++	w_var = r < W_NVARS ? r : (unsigned)W_NVARS - 1;
++	const struct wvar *v = &w_vars[w_var];
++	w_mode = (v->host_cap ? 0 : 2) | (v->bdf ? 0 : 1) | (v->cal ? 0 : 4);
++	strlcpy(w_bdf_arg, v->bdf ? v->bdf : "", sizeof(w_bdf_arg));
++	w_ind_style = v->ind;
++	w_cal_kind = v->cal ? v->cal : 1;
++	w_cal_delay = v->cal_delay;
++	w_wait_ms = v->wait;
++	w_escalate = v->escalate;
++	LOG("wlfw sweep: variant %u of %u: %s (wlfwmode %u)", w_var, (unsigned)W_NVARS - 1, v->what, w_mode);
++}
++
+ struct wmsg { uint8_t *b; uint32_t n; };
+ 
+ static bool
+@@ -3510,6 +3572,22 @@ w_simple(uint16_t msg, const char *step)
+ 	}
+ }
+ 
++static void
++w_send_cal(void)
++{
++	struct wmsg m;
++	if (!wm_new(&m, WLFW_CAL_REPORT)) {
++		return;
++	}
++	if (w_cal_kind != 2) {
++		uint8_t none = 0;
++		wm_tlv(&m, 0x01, &none, 1);             /* meta_data_len = 0 */
++	}
++	wm_send(&m);
++	LOG("t=%u ms: wlfw: cal_report sent (%s)", g_ms, w_cal_kind == 2 ? "empty" : "meta_data_len 0");
++	w_step = "cal_report sent";
++}
++
+ static void
+ w_bdf_segment(void)
+ {
+@@ -3729,11 +3807,29 @@ wlfw_arrive(uint32_t node, uint32_t port)
+ 	}
+ 	w_node = node;
+ 	w_port = port;
++	w_var_apply(w_arrivals - 1);
+ 	struct wmsg m;
+ 	if (wm_new(&m, WLFW_IND_REGISTER)) {
+ 		wm_u8(&m, 0x10, 1);                     /* fw_ready_enable */
++		if (w_ind_style == 2) {
++			wm_u8(&m, 0x11, 1);                 /* initiate_cal_download_enable */
++			wm_u8(&m, 0x12, 1);                 /* initiate_cal_update_enable */
++		}
+ 		wm_u8(&m, 0x13, 1);                     /* msa_ready_enable */
++		if (w_ind_style >= 1) {
++			wm_u8(&m, 0x14, 1);                 /* pin_connect_result_enable (icnss) */
++		}
+ 		wm_u32(&m, 0x15, WLFW_CLIENT_ID);       /* client_id */
++		if (w_ind_style == 2) {
++			wm_u8(&m, 0x18, 1);                 /* cold_boot_cal_done_enable */
++		}
++		if (w_ind_style >= 1) {
++			wm_u8(&m, 0x19, 1);                 /* rejuvenate_enable (icnss) */
++		}
++		if (w_ind_style == 2) {
++			wm_u8(&m, 0x1A, 1);                 /* xo_cal_enable */
++			wm_u8(&m, 0x1B, 1);                 /* cal_done_enable */
++		}
+ 		wm_send(&m);
+ 		w_step = "ind_register sent";
+ 	}
+@@ -3756,7 +3852,8 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			w_start_bdf();
+ 		} else if (msg == WLFW_FW_READY_IND) {
+ 			w_fw_ready = true;
+-			LOG("t=%u ms: *** WLAN FIRMWARE READY ***", g_ms);
++			w_wait_until = 0;
++			LOG("t=%u ms: *** WLAN FIRMWARE READY *** (sweep %u, variant %u)", g_ms, w_sweep, w_var);
+ 			if (wm_new(&m, WLFW_WLAN_CFG)) {
+ 				wm_array(&m, 0x11, 12, w_tgt_ce, sizeof(w_tgt_ce));
+ 				wm_array(&m, 0x12, (uint8_t)(sizeof(w_svc_ce) / sizeof(w_svc_ce[0])), w_svc_ce, sizeof(w_svc_ce));
+@@ -3765,7 +3862,13 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 				w_step = "wlan_cfg sent";
+ 			}
+ 		} else {
+-			LOG("wlfw: indication %x", msg);
++			char hx[3 * 40 + 1];
++			uint32_t n = MIN(len, 40u);
++			for (uint32_t i = 0; i < n; i++) {
++				snprintf(hx + 3 * i, 4, "%02x ", d[i]);
++			}
++			hx[3 * n] = 0;
++			LOG("t=%u ms: wlfw: *** indication %x *** (%u bytes) %s", g_ms, msg, len, hx);
+ 		}
+ 		return;
+ 	}
+@@ -3821,6 +3924,19 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		LOG("t=%u ms: wlfw: cap %s err %u (try %u)", g_ms, ok ? "ok" : "FAILED", err, w_cap_tries + 1);
+ 		if (ok) {
+ 			w_on_cap(d, len);
++			if (w_ind_style >= 1) {             /* MIUI icnss after cap: feature mask, vbatt */
++				if (wm_new(&m, WLFW_DYN_FEATURE)) {
++					uint64_t mask = 1;          /* QMI_WLFW_FW_REJUVENATE_V01 */
++					wm_tlv(&m, 0x10, &mask, 8);
++					wm_send(&m);
++				}
++				if (wm_new(&m, WLFW_VBATT)) {
++					uint64_t uv = 3800000;
++					wm_tlv(&m, 0x01, &uv, 8);
++					wm_send(&m);
++				}
++				LOG("wlfw: dynamic feature mask 0x1 and vbatt 3.8 V sent");
++			}
+ 		} else {
+ 			char hx[3 * 24 + 1];
+ 			uint32_t n = MIN(len, 24u);
+@@ -3838,6 +3954,7 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		if (w_mode & 1) {
+ 			LOG("wlfw: no host board data (wlfwmode %u): the firmware loads its own, waiting for FW_READY", w_mode);
+ 			w_step = "waiting FW_READY (no BDF)";
++			w_wait_until = w_wait_ms ? g_ms + w_wait_ms : 0;
+ 			break;
+ 		}
+ 		w_step = "waiting MSA_READY ind";
+@@ -3855,17 +3972,19 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			if (w_mode & 4) {
+ 				LOG("wlfw: cal_report skipped (wlfwmode %u), waiting for FW_READY", w_mode);
+ 				w_step = "waiting FW_READY (no cal_report)";
+-			} else if (wm_new(&m, WLFW_CAL_REPORT)) {
+-				uint8_t none = 0;
+-				wm_tlv(&m, 0x01, &none, 1);     /* meta_data_len = 0 */
+-				wm_send(&m);
+-				w_step = "cal_report sent";
++				w_wait_until = w_wait_ms ? g_ms + w_wait_ms : 0;
++			} else if (w_cal_delay != 0) {
++				w_cal_at_ms = g_ms + w_cal_delay;
++				w_step = "cal_report delayed";
++			} else {
++				w_send_cal();
+ 			}
+ 		}
+ 		break;
+ 	case WLFW_CAL_REPORT:
+ 		LOG("wlfw: cal_report %s err %u, waiting for FW_READY", ok ? "ok" : "FAILED", err);
+ 		w_step = "waiting FW_READY";
++		w_wait_until = w_wait_ms ? g_ms + w_wait_ms : 0;
+ 		break;
+ 	case WLFW_WLAN_CFG:
+ 		LOG("wlfw: wlan_cfg %s err %u", ok ? "ok" : "FAILED", err);
+@@ -3932,7 +4051,9 @@ wifi_enabled(void)
+ 		if (strcmp(w_bdf_arg, "-") == 0) {
+ 			w_bdf_arg[0] = 0;
+ 		}
+-		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report, 8 no MSA assign), wlfwbdf \"%s\"", w_mode, w_bdf_arg);
++		w_sweep = 0;
++		(void)PE_parse_boot_argn("wlfwsweep", &w_sweep, sizeof(w_sweep));
++		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report, 8 no MSA assign), wlfwbdf \"%s\", wlfwsweep %u (%u variants)", w_mode, w_bdf_arg, w_sweep, (unsigned)W_NVARS);
+ 	}
+ 	return wifi_on > 0;
+ }
+@@ -6364,6 +6485,28 @@ radio_poll(unsigned ms)
+ 		w_cap_retry_ms = 0;
+ 		w_simple(WLFW_CAP, "cap sent again");
+ 	}
++	if (w_cal_at_ms != 0 && g_ms >= w_cal_at_ms) {
++		w_cal_at_ms = 0;
++		w_send_cal();
++	}
++	if (w_wait_until != 0 && !w_fw_ready && g_ms >= w_wait_until) {
++		w_wait_until = 0;
++		LOG("t=%u ms: wlfw sweep: variant %u: no FW_READY in %u ms (last step: %s)", g_ms, w_var, w_wait_ms, w_step);
++		if (w_escalate && !w_escalated) {
++			w_escalated = true;
++			w_cal_kind = 1;
++			w_cal_delay = 0;
++			if (!w_bdf_started) {
++				LOG("wlfw sweep: now BDF bd_j20s + cal_report, to restart the PD for the next variant");
++				w_mode &= 2;
++				strlcpy(w_bdf_arg, "bd_j20s.bin", sizeof(w_bdf_arg));
++				w_start_bdf();
++			} else {
++				LOG("wlfw sweep: now cal_report, to restart the PD for the next variant");
++				w_send_cal();
++			}
++		}
++	}
+ 	if (!ce_up) {
+ 		return;
+ 	}
+-- 
+2.53.0
+

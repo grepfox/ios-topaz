@@ -1,0 +1,90 @@
+From 375c87e1e944394791c5500973510d24f6e4bf5d Mon Sep 17 00:00:00 2001
+From: grep <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:48:10 +0200
+Subject: [PATCH] vayu: wlfwmode switches (no host BDF/cal_report, no host_cap)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 32 +++++++++++++++++++++++++++++---
+ 1 file changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 69e73c7..7108b64 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3419,6 +3419,13 @@ static uint32_t g_msa_base = 0x51900000u;
+ #define VMID_WLAN_CE        0x19
+ 
+ static uint32_t w_node, w_port, w_board = 0xFF, w_bdf_seg;
++/*
++ * wlfwmode= bits: 1 = no host BDF download and no cal_report (downstream icnss on SM8150
++ * sends neither: the WLAN firmware reads its board file itself over tftp), 2 = no host_cap,
++ * 4 = BDF but no cal_report. vayu 1019: every WLAN PD died 10 ms after our cal_report with
++ * "EX:wlan_process:0x1:WLAN RT:0x68:PC=0xb0193780". Default 1 on vayu, 0 elsewhere.
++ */
++static uint32_t w_mode;
+ static uint16_t w_txn = 1;
+ static bool w_msa_ind, w_cap_done, w_bdf_started, w_fw_ready, w_mission;
+ static int w_bdf_fi = -1;
+@@ -3539,7 +3546,7 @@ static void
+ w_start_bdf(void)
+ {
+ 	char name[40];
+-	if (w_bdf_started || !w_msa_ind || !w_cap_done) {
++	if (w_bdf_started || !w_msa_ind || !w_cap_done || (w_mode & 1)) {
+ 		return;
+ 	}
+ 	w_bdf_started = true;
+@@ -3749,7 +3756,15 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			memcpy(&st, v, 8);
+ 		}
+ 		LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx", g_ms, ok ? "ok" : "FAILED", err, st);
+-		if (wm_new(&m, WLFW_HOST_CAP)) {
++		if (w_mode & 2) {
++			if (wm_new(&m, WLFW_MSA_INFO)) {    /* host_cap skipped (wlfwmode bit 2) */
++				uint64_t a = WLFW_MSA_BASE;
++				wm_tlv(&m, 0x01, &a, 8);
++				wm_u32(&m, 0x02, WLFW_MSA_SIZE);
++				wm_send(&m);
++				w_step = "msa_info sent (no host_cap)";
++			}
++		} else if (wm_new(&m, WLFW_HOST_CAP)) {
+ 			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
+ 			wm_send(&m);
+ 			w_step = "host_cap sent";
+@@ -3795,6 +3810,11 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			}
+ 		}
+ 		w_cap_done = true;
++		if (w_mode & 1) {
++			LOG("wlfw: no host board data (wlfwmode %u): the firmware loads its own, waiting for FW_READY", w_mode);
++			w_step = "waiting FW_READY (no BDF)";
++			break;
++		}
+ 		w_step = "waiting MSA_READY ind";
+ 		w_start_bdf();
+ 		break;
+@@ -3807,7 +3827,10 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			w_bdf_segment();
+ 		} else {
+ 			LOG("wlfw: board data sent in %u segment(s)", w_bdf_seg);
+-			if (wm_new(&m, WLFW_CAL_REPORT)) {
++			if (w_mode & 4) {
++				LOG("wlfw: cal_report skipped (wlfwmode %u), waiting for FW_READY", w_mode);
++				w_step = "waiting FW_READY (no cal_report)";
++			} else if (wm_new(&m, WLFW_CAL_REPORT)) {
+ 				uint8_t none = 0;
+ 				wm_tlv(&m, 0x01, &none, 1);     /* meta_data_len = 0 */
+ 				wm_send(&m);
+@@ -3876,6 +3899,9 @@ wifi_enabled(void)
+ 	if (wifi_on < 0) {
+ 		uint32_t v = 0;
+ 		wifi_on = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
++		w_mode = g_rmtfs_nav ? 0 : 1;            /* vayu (no NAV) defaults to 1 */
++		(void)PE_parse_boot_argn("wlfwmode", &w_mode, sizeof(w_mode));
++		LOG("wlfw: wlfwmode %u (1 no BDF/cal, 2 no host_cap, 4 no cal_report)", w_mode);
+ 	}
+ 	return wifi_on > 0;
+ }
+-- 
+2.53.0
+
